@@ -1,5 +1,6 @@
 from typing import Dict, Optional, List
 
+
 # ═══════════════════════════════════════════════════════════════
 # BUILDING-LEVEL TRACKER (Entry / Exit)
 # ═══════════════════════════════════════════════════════════════
@@ -30,23 +31,22 @@ class EPCTracker:
     (real exit followed by quick re-entry), and both must be returned.
     """
 
-    MIN_COUNT            = 3    # fewer reads than this = noise, ignore
-    RSSI_GHOST_THRESHOLD = -72  # weaker than this = ghost, ignore immediately
+    MIN_COUNT            = 3
+    RSSI_GHOST_THRESHOLD = -72
     PENDING_EXIT_TIMEOUT = 10   # seconds
 
     def __init__(self, epc: str):
         self.epc          = epc
         self.state        = "UNKNOWN"
         self.events       = []
-        self.pending_exit = None  # holds unconfirmed Out burst
-        self.entry_t0     = None  # used to compute dwell time on exit
+        self.pending_exit = None
+        self.entry_t0     = None
 
     def process_event(self, agg: Dict) -> List[Dict]:
         """
-        Processes one aggregated burst and returns a list of confirmed events.
-        Returns [] if the burst is filtered out.
-        Returns [ENTRY] for a normal entry.
-        Returns [EXIT, ENTRY] when a real exit is immediately followed by re-entry.
+        Processes one aggregated burst.
+        Returns a list of confirmed events — empty if filtered out,
+        [ENTRY] normally, or [EXIT, ENTRY] when a real exit precedes re-entry.
         """
         direction = agg["direction"]
         peak_rssi = agg["peak_rssi"]
@@ -54,30 +54,35 @@ class EPCTracker:
         t0        = agg["t0_start"]
         confirmed = []
 
-        # ── Filter 1: noise suppression ──────────────────────────
+        # ── Filter 1: noise suppression ───────────────────────────
+        # Too few reads — not a real crossing event, discard
         if count < self.MIN_COUNT:
             return []
 
-        # ── Filter 2: immediate ghost suppression ─────────────────
+        # ── Filter 2: immediate ghost suppression ──────────────────
+        # Out read while inside/unknown with a very weak signal
+        # = tag bleeding through the wall, not a real exit
         if direction == "Out" and self.state in ("INSIDE", "UNKNOWN"):
             if peak_rssi < self.RSSI_GHOST_THRESHOLD:
                 return []
 
-        # ── Filter 3: duplicate state ─────────────────────────────
+        # ── Filter 3: duplicate state ──────────────────────────────
+        # Event wouldn't change state — nothing to do
         if direction == "In"  and self.state == "INSIDE":  return []
         if direction == "Out" and self.state == "OUTSIDE": return []
 
-        # ── Pending exit: hold Out bursts, don't confirm immediately ──
+        # ── Hold Out bursts as pending — don't confirm immediately ─
+        # We wait to see if an In burst follows (ghost check)
         if direction == "Out":
             self.pending_exit = agg
             return []
 
-       # ── direction == "In" from here ────────────────────────────
+        # ── direction == "In" from here ────────────────────────────
         if self.pending_exit is not None:
             gap      = t0 - self.pending_exit["t0_start"]
             out_rssi = self.pending_exit["peak_rssi"]
             in_rssi  = peak_rssi
- 
+
             if gap <= self.PENDING_EXIT_TIMEOUT:
                 if out_rssi <= in_rssi:
                     # Out signal weaker or equal → person walking toward inside
@@ -87,17 +92,15 @@ class EPCTracker:
                     # Out signal stronger → person was genuinely near exit first
                     # → real exit followed by quick re-entry, confirm exit first
                     exit_event = self._confirm_exit(self.pending_exit)
-                    if exit_event:                    # guard: None if no prior entry
-                        confirmed.append(exit_event)
+                    confirmed.append(exit_event)
                     self.pending_exit = None
             else:
                 # Gap too large → exit was real regardless of RSSI
                 exit_event = self._confirm_exit(self.pending_exit)
-                if exit_event:                        # guard: None if no prior entry
-                    confirmed.append(exit_event)
+                confirmed.append(exit_event)
                 self.pending_exit = None
 
-        # ── Confirm entry ─────────────────────────────────────────
+        # ── Confirm entry ──────────────────────────────────────────
         self.state    = "INSIDE"
         self.entry_t0 = t0
         entry_event = {
@@ -112,19 +115,20 @@ class EPCTracker:
         confirmed.append(entry_event)
         return confirmed
 
-    def _confirm_exit(self, agg: Dict) -> Optional[Dict]:
-        """Only confirms exit if person was previously confirmed inside."""
-        if self.entry_t0 is None and self.state == "UNKNOWN":
-            # Never had a confirmed entry — this exit makes no sense, discard
-            return None
-
+    def _confirm_exit(self, agg: Dict) -> Dict:
+        """
+        Confirms an exit event and computes dwell time.
+        Always returns an event — never discards.
+        dwell_time is None when there was no prior confirmed entry,
+        which is itself an anomaly signal for the detection layer.
+        """
         self.state = "OUTSIDE"
-        dwell_time = agg["t0_start"] - self.entry_t0 if self.entry_t0 is not None else None
+        dwell_time = agg["t0_end"] - self.entry_t0 if self.entry_t0 is not None else None
         event = {
             "epc":        self.epc,
             "event":      "EXIT",
             "door":       agg["door"],
-            "t0":         agg["t0_start"],
+            "t0":         agg["t0_end"],
             "peak_rssi":  agg["peak_rssi"],
             "count":      agg["count"],
             "dwell_time": dwell_time,
@@ -157,13 +161,15 @@ class MovementTracker:
     Only activates when EPCTracker state is INSIDE.
 
     Produces ZONE_TRANSITION events when the person moves from one
-    inside reader to another — giving a trail of their path through
-    the building during their visit.
+    inside reader to another.
 
-    Note: Out reads are ignored here — those belong to EPCTracker.
+    Uses t0_end (last row of burst) as the transition timestamp — not
+    t0_start — because a burst may begin accumulating before the building-
+    level entry is confirmed. Using t0_end ensures the transition timestamp
+    is always within the confirmed INSIDE period.
     """
 
-    MIN_COUNT = 3  # same threshold as EPCTracker — weak bursts ignored
+    MIN_COUNT = 3
 
     def __init__(self, epc: str):
         self.epc          = epc
@@ -179,13 +185,13 @@ class MovementTracker:
         if agg["direction"] == "Out":
             return None
 
-        # Apply same noise filter as EPCTracker
+        # Same noise filter as EPCTracker
         if agg["count"] < self.MIN_COUNT:
             return None
 
         new_zone = agg["device"]
 
-        # First zone detected after entry — just set it, no transition yet
+        # First zone detected after entry — set it, no transition yet
         if self.current_zone is None:
             self.current_zone = new_zone
             return None
@@ -200,7 +206,7 @@ class MovementTracker:
             "event":     "ZONE_TRANSITION",
             "from_zone": self.current_zone,
             "to_zone":   new_zone,
-            "t0":        agg["t0_end"],    # ← changed from t0_start to t0_end
+            "t0":        agg["t0_end"],    # use t0_end, not t0_start
             "peak_rssi": agg["peak_rssi"],
         }
         self.transitions.append(transition)
@@ -208,5 +214,5 @@ class MovementTracker:
         return transition
 
     def reset(self):
-        """Call when person exits — clears their position for next entry."""
+        """Call when person exits — clears position for next entry."""
         self.current_zone = None

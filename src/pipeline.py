@@ -71,6 +71,11 @@ def run_pipeline(file_path: str, sheet_name: str) -> List[Dict]:
     Returns all confirmed events (ENTRY, EXIT, ZONE_TRANSITION,
     SESSION_ENDED_INSIDE) sorted chronologically.
 
+    All events are surfaced as-is — including exits before entries,
+    zone transitions before entries, and zone transitions after exits.
+    These are data anomalies and are preserved intentionally so the
+    anomaly detection layer can flag and analyse them.
+
     Reset between sheets by calling run_pipeline() fresh for each —
     trackers and buffers are local to each call.
     """
@@ -124,9 +129,11 @@ def run_pipeline(file_path: str, sheet_name: str) -> List[Dict]:
         if exit_event:
             all_events.append(exit_event)
 
-    # Flag sessions that ended without a confirmed exit
+    # Flag sessions that ended without a confirmed exit.
+    # Covers INSIDE (entry confirmed, no exit) and UNKNOWN (only exits
+    # recorded with no entry — exit events still surface with dwell_time=None).
     for epc, tracker in epc_trackers.items():
-        if tracker.state == "INSIDE":
+        if tracker.state in ("INSIDE", "UNKNOWN"):
             all_events.append({
                 "epc":   epc,
                 "event": "SESSION_ENDED_INSIDE",
@@ -134,30 +141,8 @@ def run_pipeline(file_path: str, sheet_name: str) -> List[Dict]:
                 "note":  "Stream ended before exit was detected — possible data gap or anomaly"
             })
 
-    # ── Post-processing ───────────────────────────────────────────
-    # FIX 1: sort all events chronologically by t0
-    # SESSION_ENDED_INSIDE has t0=None — push it to the end
+    # Sort all events chronologically by t0.
+    # SESSION_ENDED_INSIDE has t0=None — pushed to the end.
     all_events.sort(key=lambda e: e["t0"] if e["t0"] is not None else float("inf"))
 
-    # FIX 2: remove zone transitions that occurred after the EXIT for that EPC
-    # These are physically impossible — person can't move inside after exiting.
-    # They arise because end-of-stream In bursts are processed before the
-    # Out burst that confirms the exit (Out burst has a later t0_start).
-    exit_t0_by_epc: Dict[str, int] = {}
-    for e in all_events:
-        if e["event"] == "EXIT" and e.get("t0") is not None:
-            exit_t0_by_epc[e["epc"]] = e["t0"]
-
-    all_events = [
-        e for e in all_events
-        if not (
-            e["event"] == "ZONE_TRANSITION"
-            and e["epc"] in exit_t0_by_epc
-            and e.get("t0") is not None
-            and e["t0"] > exit_t0_by_epc[e["epc"]]
-        )
-    ]
-
     return all_events
-
-
