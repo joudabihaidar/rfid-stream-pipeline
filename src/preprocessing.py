@@ -45,21 +45,14 @@ def parse_tagtime(raw: str) -> int:
     """
     return int(float(raw))
 
-def preprocess_row(raw_row: Dict[str, str]) -> Optional[Dict]:
-    """
-    Casts and validates a single raw row from the stream.
-    Returns None if the row is malformed — pipeline skips it silently.
-
-    Note: DictReader yields everything as strings.
-          We cast RSSI and T0 here so downstream code works with numbers.
-    """
+def preprocess_row(raw_row: Dict) -> Optional[Dict]:
     try:
         return {
-            "epc":       raw_row["EPC"].strip(),
-            "device":    raw_row["BaseLogicalDevice"].strip(),
-            "direction": raw_row["Direction"].strip(),
-            "door":      raw_row["Door"].strip(),
-            "rssi":      int(raw_row["RSSI"]),
+            "epc":       str(raw_row["epc"]).strip(),
+            "device":    str(raw_row["baselogicaldevice"]).strip(),
+            "direction": str(raw_row["direction"]).strip(),
+            "door":      str(raw_row["door"]).strip(),
+            "rssi":      float(raw_row["rssi"]),  # float not int — sheets 4-7 have -75.5
             "t0":        int(raw_row["T0"]),
         }
     except (ValueError, KeyError):

@@ -1,29 +1,31 @@
-import csv
 import time
+import openpyxl
 from typing import Generator, Dict
-from preprocessing import derive_t0, normalize_columns, parse_tagtime
 
-def stream_rfid_data(file_path: str, delay: float = 0.0):
-    """
-    Streams rows from a CSV file, normalizing column names
-    and deriving T0 for sheets that don't have it.
-    """
-    # First pass — get session start time for T0 derivation
-    with open(file_path, mode='r', encoding='utf-8') as f:
-        first_row = normalize_columns(next(csv.DictReader(f)))
-        session_start_ms = parse_tagtime(first_row["TagTime"])
+def stream_rfid_excel(file_path, sheet_name, delay=0.0):
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    ws = wb[sheet_name]
 
-    # Second pass — stream and normalize
-    with open(file_path, mode='r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for raw_row in reader:
-            row = normalize_columns(raw_row)
+    rows    = iter(ws.rows)
+    headers = [str(cell.value).strip().lower() for cell in next(rows)]
 
-            # Derive T0 if missing (sheets 4-7)
-            if "T0" not in row or row["T0"].strip() == "":
-                tag_time_ms = parse_tagtime(row["TagTime"])
-                row["T0"]   = str(derive_t0(tag_time_ms, session_start_ms))
+    # Read all rows into memory, sort by TagTime, then stream
+    all_rows = []
+    for row in rows:
+        values = [cell.value for cell in row]
+        record = dict(zip(headers, values))
+        all_rows.append(record)
 
-            yield row
-            if delay > 0:
-                time.sleep(delay)
+    # Sort by TagTime ascending before deriving T0
+    all_rows.sort(key=lambda r: int(float(str(r["tagtime"]))))
+
+    session_start_ms = int(float(str(all_rows[0]["tagtime"])))
+
+    for record in all_rows:
+        tag_time_ms  = int(float(str(record["tagtime"])))
+        record["T0"] = round((tag_time_ms - session_start_ms) / 1000)
+        yield record
+        if delay > 0:
+            time.sleep(delay)
+
+    wb.close()
