@@ -1,103 +1,188 @@
 from typing import Dict, Optional, List
 
-class UIDTracker:
+# ═══════════════════════════════════════════════════════════════
+# 4. BUILDING-LEVEL TRACKER (Entry / Exit)
+# ═══════════════════════════════════════════════════════════════
+
+class EPCTracker:
     """
-    Tracks the real-time physical state of a single unique badge (UID).
-    States: 'UNKNOWN', 'INSIDE', 'OUTSIDE'
+    Tracks whether a single person (EPC) is INSIDE or OUTSIDE the building.
+
+    State machine:
+        UNKNOWN → INSIDE  (first confirmed entry)
+        INSIDE  → OUTSIDE (confirmed exit)
+        OUTSIDE → INSIDE  (re-entry)
+
+    Three filters gate every state change:
+        Filter 1 — noise:  burst count must meet minimum threshold
+        Filter 2 — ghost:  weak Out reads while inside are suppressed
+        Filter 3 — duplicate: ignores events that wouldn't change state
+
+    Ghost suppression uses BOTH time AND RSSI (change 1 + 2):
+        If an Out burst is followed by an In burst within PENDING_EXIT_TIMEOUT
+        seconds AND the Out signal was weaker or equal to the In signal,
+        the Out burst is treated as a ghost read and discarded.
+        If the Out signal was stronger, the person was genuinely near the
+        exit — the exit is confirmed before the entry.
     """
-    RSSI_GHOST_THRESHOLD = -72  # Signal weaker than this = noise/bleed
-    MIN_COUNT = 3               # Fewer hits than this = fleeting noise
-    EXIT_GRACE_PERIOD = 15      # Seconds to wait before confirming an exit
 
-    def __init__(self, uid: str):
-        self.uid = uid
-        self.state = "UNKNOWN"
-        self.events_history: List[Dict] = []
-        self.pending_exit: Optional[Dict] = None
+    MIN_COUNT            = 3    # fewer reads than this = noise, ignore
+    RSSI_GHOST_THRESHOLD = -72  # weaker than this = ghost, ignore immediately
+    PENDING_EXIT_TIMEOUT = 10   # seconds (change 1: reduced from 15)
 
-    def process_event(self, agg_event: Dict, current_stream_time: int) -> Optional[Dict]:
-        """
-        Processes a single aggregated burst event frame.
-        Returns a confirmed transaction dictionary ('ENTRY' or 'EXIT') or None.
-        """
-        direction = agg_event["direction"]
-        peak_rssi = agg_event["peak_rssi"]
-        count = agg_event["count"]
-        t0 = agg_event["t0_start"]
+    def __init__(self, epc: str):
+        self.epc          = epc
+        self.state        = "UNKNOWN"
+        self.events       = []
+        self.pending_exit = None  # holds unconfirmed Out burst
+        self.entry_t0     = None  # used to compute dwell time on exit
 
-        # --- RULE 1: TIME-BASED EVICTION ---
-        # Before evaluating the new frame, check if a held exit has aged out
-        if self.pending_exit is not None:
-            time_gap = current_stream_time - self.pending_exit["t0_start"]
-            if time_gap > self.EXIT_GRACE_PERIOD:
-                # 15+ seconds of quiet passed. The exit was real!
-                confirmed_exit = self._commit_exit()
-                
-                # If the new event that woke us up is an 'In', process it next
-                if direction == "In":
-                    self.state = "INSIDE"
-                    confirmed_entry = self._commit_entry(agg_event)
-                    return confirmed_entry # In a stream, you'd emit both, let's return this entry
-                
-                return confirmed_exit
+    def process_event(self, agg: Dict) -> Optional[Dict]:
+        direction = agg["direction"]
+        peak_rssi = agg["peak_rssi"]
+        count     = agg["count"]
+        t0        = agg["t0_start"]
 
-        # --- RULE 2: NOISE & GHOST FILTERS ---
+        # ── Filter 1: noise suppression ──────────────────────────
         if count < self.MIN_COUNT:
             return None
 
+        # ── Filter 2: immediate ghost suppression ─────────────────
+        # Out read while inside with a very weak signal = bleed-through wall
         if direction == "Out" and self.state in ("INSIDE", "UNKNOWN"):
             if peak_rssi < self.RSSI_GHOST_THRESHOLD:
-                # Suppress signal bleed through office walls
                 return None
 
-        # --- RULE 3: DUPLICATE STATE PROTECTION ---
-        if direction == "In" and self.state == "INSIDE":
-            return None
-        if direction == "Out" and self.state == "OUTSIDE":
-            return None
+        # ── Filter 3: duplicate state ─────────────────────────────
+        if direction == "In"  and self.state == "INSIDE":  return None
+        if direction == "Out" and self.state == "OUTSIDE": return None
 
-        # --- RULE 4: TRANSITION LOGIC ---
-        if direction == "Out" and self.state in ("UNKNOWN", "INSIDE"):
-            # Put the exit in purgatory to see if they immediately step back in
-            self.pending_exit = agg_event
+        # ── Pending exit: hold Out bursts, don't confirm immediately ──
+        if direction == "Out":
+            self.pending_exit = agg
             return None
 
-        if direction == "In":
-            if self.pending_exit is not None:
-                # An 'In' burst arrived quickly! The 'Out' was just a ghost read.
-                self.pending_exit = None 
-            
-            self.state = "INSIDE"
-            return self._commit_entry(agg_event)
+        # ── direction == "In" from here ───────────────────────────
+        if self.pending_exit is not None:
+            gap           = t0 - self.pending_exit["t0_start"]
+            out_rssi      = self.pending_exit["peak_rssi"]
+            in_rssi       = peak_rssi
 
+            if gap <= self.PENDING_EXIT_TIMEOUT:
+                # change 2: combine time AND RSSI for ghost decision
+                if out_rssi <= in_rssi:
+                    # Out signal weaker or equal → person walking toward inside
+                    # → Out was a ghost, discard it
+                    self.pending_exit = None
+                else:
+                    # Out signal stronger → person was genuinely near exit first
+                    # → real exit followed by quick re-entry, confirm both
+                    self._confirm_exit(self.pending_exit)
+                    self.pending_exit = None
+            else:
+                # Gap too large → exit was real regardless of RSSI
+                self._confirm_exit(self.pending_exit)
+                self.pending_exit = None
+
+        # ── Confirm entry ─────────────────────────────────────────
+        self.state    = "INSIDE"
+        self.entry_t0 = t0
+        event = {
+            "epc":       self.epc,
+            "event":     "ENTRY",
+            "door":      agg["door"],
+            "t0":        t0,
+            "peak_rssi": peak_rssi,
+            "count":     count,
+        }
+        self.events.append(event)
+        return event
+
+    def _confirm_exit(self, agg: Dict):
+        """Confirms an exit event and computes dwell time (change 5)."""
+        self.state    = "OUTSIDE"
+        dwell_time    = agg["t0_start"] - self.entry_t0 if self.entry_t0 is not None else None
+        event = {
+            "epc":        self.epc,
+            "event":      "EXIT",
+            "door":       agg["door"],
+            "t0":         agg["t0_start"],
+            "peak_rssi":  agg["peak_rssi"],
+            "count":      agg["count"],
+            "dwell_time": dwell_time,   # seconds spent inside (change 5)
+        }
+        self.events.append(event)
+        self.entry_t0 = None
+        return event
+
+    def flush_pending_exit(self) -> Optional[Dict]:
+        """
+        Called at end of stream.
+        If an Out burst was pending and never followed by an In,
+        the person genuinely left — confirm the exit.
+        """
+        if self.pending_exit is not None:
+            agg = self.pending_exit
+            self.pending_exit = None
+            if agg["count"] >= self.MIN_COUNT:
+                return self._confirm_exit(agg)
         return None
 
-    def flush_final_exit(self) -> Optional[Dict]:
-        """Forcibly flushes any remaining pending exit when the data file ends."""
-        if self.pending_exit:
-            return self._commit_exit()
-        return None
 
-    def _commit_entry(self, agg_event: Dict) -> Dict:
-        entry_record = {
-            "uid": self.uid,
-            "event": "ENTRY",
-            "door": agg_event["door"],
-            "timestamp": agg_event["t0_start"],
-            "peak_rssi": agg_event["peak_rssi"]
-        }
-        self.events_history.append(entry_record)
-        return entry_record
+# ═══════════════════════════════════════════════════════════════
+# 5. MOVEMENT TRACKER (Zone transitions inside the building)
+# ═══════════════════════════════════════════════════════════════
 
-    def _commit_exit(self) -> Dict:
-        exit_record = {
-            "uid": self.uid,
-            "event": "EXIT",
-            "door": self.pending_exit["door"],
-            "timestamp": self.pending_exit["t0_start"],
-            "peak_rssi": self.pending_exit["peak_rssi"]
+class MovementTracker:
+    """
+    Tracks a person's movement between checkpoints while INSIDE the building.
+    Only activates when EPCTracker state is INSIDE.
+
+    Produces ZONE_TRANSITION events when the person moves from one
+    inside reader to another — giving a trail of their path through
+    the building during their visit.
+
+    Note: Out reads are ignored here — those belong to EPCTracker.
+    """
+
+    def __init__(self, epc: str):
+        self.epc          = epc
+        self.current_zone = None
+        self.transitions  = []
+
+    def process_event(self, agg: Dict, building_state: str) -> Optional[Dict]:
+        # Only track movement when person is confirmed inside
+        if building_state != "INSIDE":
+            return None
+
+        # Out reads belong to the building tracker, not here
+        if agg["direction"] == "Out":
+            return None
+
+        new_zone = agg["device"]
+
+        # First zone detected after entry — just set it, no transition yet
+        if self.current_zone is None:
+            self.current_zone = new_zone
+            return None
+
+        # Still at the same checkpoint — no transition
+        if new_zone == self.current_zone:
+            return None
+
+        # Genuine zone transition
+        transition = {
+            "epc":       self.epc,
+            "event":     "ZONE_TRANSITION",
+            "from_zone": self.current_zone,
+            "to_zone":   new_zone,
+            "t0":        agg["t0_start"],
+            "peak_rssi": agg["peak_rssi"],
         }
-        self.events_history.append(exit_record)
-        self.state = "OUTSIDE"
-        self.pending_exit = None
-        return exit_record
+        self.transitions.append(transition)
+        self.current_zone = new_zone
+        return transition
+
+    def reset(self):
+        """Call when person exits — clears their position for next entry."""
+        self.current_zone = None
