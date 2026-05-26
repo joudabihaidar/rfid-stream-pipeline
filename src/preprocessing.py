@@ -1,5 +1,6 @@
 import csv
 from typing import List, Dict
+from typing import Generator, Dict, Optional, List
 
 # Mapping from lowercase (sheets 4-7) to canonical column names
 COLUMN_MAP = {
