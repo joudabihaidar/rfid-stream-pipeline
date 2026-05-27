@@ -1,0 +1,418 @@
+# dashboard/app.py
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+# Add project root to path so src/ and analytics/ are importable
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.database import (
+    get_all_sessions,
+    get_events_for_session,
+    get_all_anomalies,
+    get_dwell_times,
+    get_door_usage,
+    get_zone_transition_paths,
+    get_anomaly_summary,
+)
+
+# ═══════════════════════════════════════════════════════════════
+# PAGE CONFIG
+# ═══════════════════════════════════════════════════════════════
+
+st.set_page_config(
+    page_title="RFID Building Access Tracker",
+    page_icon="🏢",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ═══════════════════════════════════════════════════════════════
+# DATA LOADING (cached — refreshes every 60 seconds)
+# ═══════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=60)
+def load_sessions():
+    return pd.DataFrame(get_all_sessions())
+
+@st.cache_data(ttl=60)
+def load_anomalies():
+    return pd.DataFrame(get_all_anomalies())
+
+@st.cache_data(ttl=60)
+def load_dwell_times():
+    return pd.DataFrame(get_dwell_times())
+
+@st.cache_data(ttl=60)
+def load_door_usage():
+    return pd.DataFrame(get_door_usage())
+
+@st.cache_data(ttl=60)
+def load_zone_paths():
+    return pd.DataFrame(get_zone_transition_paths())
+
+@st.cache_data(ttl=60)
+def load_anomaly_summary():
+    return pd.DataFrame(get_anomaly_summary())
+
+sessions_df  = load_sessions()
+anomalies_df = load_anomalies()
+dwell_df     = load_dwell_times()
+door_df      = load_door_usage()
+zone_df      = load_zone_paths()
+anomaly_sum  = load_anomaly_summary()
+
+# ═══════════════════════════════════════════════════════════════
+# SIDEBAR
+# ═══════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.title("🏢 RFID Tracker")
+    st.caption("Real-time building access monitoring")
+    st.divider()
+
+    session_ids = sessions_df["session_id"].tolist() if not sessions_df.empty else []
+
+    selected_session = st.selectbox(
+        "Session",
+        options=session_ids,
+        index=0 if session_ids else None,
+        help="Select a test case session to inspect",
+    )
+
+    st.divider()
+    st.subheader("Live replay")
+    replay_speed = st.slider(
+        "Delay between events (s)",
+        min_value=0.1,
+        max_value=3.0,
+        value=0.8,
+        step=0.1,
+    )
+    start_replay = st.button("▶ Start Replay", use_container_width=True, type="primary")
+
+    st.divider()
+    total_events   = sum(sessions_df["total_entries"] + sessions_df["total_exits"]) if not sessions_df.empty else 0
+    total_anomalies = len(anomalies_df) if not anomalies_df.empty else 0
+    st.caption(f"{len(sessions_df)} sessions · {int(total_events)} events · {total_anomalies} anomalies")
+
+# ═══════════════════════════════════════════════════════════════
+# TABS
+# ═══════════════════════════════════════════════════════════════
+
+tab1, tab2, tab3 = st.tabs(["📡 Live Feed", "📊 Access Patterns", "⚠️ Anomalies"])
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 1 — LIVE FEED
+# ═══════════════════════════════════════════════════════════════
+
+with tab1:
+    if not selected_session:
+        st.info("Select a session from the sidebar.")
+    else:
+        # Session header
+        session_row = sessions_df[sessions_df["session_id"] == selected_session].iloc[0]
+
+        st.subheader(f"Session: {selected_session}")
+        st.caption(f"Date: {session_row.get('session_date', 'N/A')}  ·  "
+                   f"EPC: ...{str(session_row.get('epc', ''))[-8:]}  ·  "
+                   f"Entry signal: {session_row.get('entry_rssi_strength', 'N/A')}  ·  "
+                   f"Ghost ratio: {float(session_row.get('ghost_read_ratio') or 0):.1%}")
+
+        st.divider()
+
+        # Metric placeholders — updated during replay
+        metrics_area = st.empty()
+        st.markdown("**Event log**")
+        feed_area = st.empty()
+
+        # Load events and anomaly data for this session
+        session_events    = get_events_for_session(selected_session)
+        session_anomalies = (
+            anomalies_df[anomalies_df["session_id"] == selected_session]
+            if not anomalies_df.empty else pd.DataFrame()
+        )
+        anomaly_t0s = set(
+            session_anomalies["t0"].dropna().astype(int).tolist()
+        ) if not session_anomalies.empty else set()
+
+        def render_metrics(displayed_events):
+            entries = sum(1 for e in displayed_events if e["event_type"] == "ENTRY")
+            exits   = sum(1 for e in displayed_events if e["event_type"] == "EXIT")
+            inside  = max(0, entries - exits)
+            flags   = len(session_anomalies) if not session_anomalies.empty else 0
+
+            with metrics_area.container():
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Currently inside", inside)
+                c2.metric("Entries", entries)
+                c3.metric("Exits", exits)
+                c4.metric("Anomalies flagged", flags,
+                          delta="review required" if flags > 0 else None,
+                          delta_color="inverse")
+
+        def render_feed(displayed_events):
+            df = pd.DataFrame(displayed_events)
+            rename = {
+                "event_type": "Event",
+                "t0":         "T0 (s)",
+                "door":       "Door",
+                "from_zone":  "From zone",
+                "to_zone":    "To zone",
+                "peak_rssi":  "Peak RSSI",
+                "dwell_time": "Dwell (s)",
+            }
+            df = df.rename(columns=rename)
+            df["EPC"] = df["epc"].str[-8:] if "epc" in df.columns else ""
+
+            # Shorten zone names for readability
+            for col in ["From zone", "To zone"]:
+                if col in df.columns:
+                    df[col] = df[col].str.split("__").str[-1]
+
+            cols = ["Event", "T0 (s)", "Door", "From zone", "To zone", "Dwell (s)", "Peak RSSI"]
+            cols = [c for c in cols if c in df.columns]
+
+            with feed_area.container():
+                st.dataframe(df[cols], use_container_width=True, height=320)
+
+        if start_replay and session_events:
+            # ── Real-time replay ──────────────────────────────────────
+            displayed = []
+            for event in session_events:
+                displayed.append(event)
+                render_metrics(displayed)
+                render_feed(displayed)
+
+                # Fire toast on anomaly events
+                t0_val = event.get("t0")
+                if event["event_type"] == "SESSION_ENDED_INSIDE":
+                    st.toast("⚠️ Session ended inside building", icon="🚨")
+                elif t0_val is not None and int(t0_val) in anomaly_t0s:
+                    st.toast(f"⚠️ Anomaly at T0={t0_val} — {event['event_type']}", icon="🚨")
+
+                time.sleep(replay_speed)
+
+        else:
+            # ── Static view (before replay) ───────────────────────────
+            if session_events:
+                render_metrics(session_events)
+                render_feed(session_events)
+            else:
+                st.info("No events found for this session.")
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 2 — ACCESS PATTERNS
+# ═══════════════════════════════════════════════════════════════
+
+with tab2:
+    if sessions_df.empty:
+        st.info("No data available. Run main.py first.")
+    else:
+        # ── Summary metrics ───────────────────────────────────────────
+        total_entries     = int(sessions_df["total_entries"].sum())
+        total_exits       = int(sessions_df["total_exits"].sum())
+        total_transitions = int(sessions_df["total_transitions"].sum())
+        avg_dwell         = dwell_df["dwell_time"].mean() if not dwell_df.empty else 0
+        max_dwell         = dwell_df["dwell_time"].max()  if not dwell_df.empty else 0
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Total entries",      total_entries)
+        c2.metric("Total exits",        total_exits)
+        c3.metric("Zone transitions",   total_transitions)
+        c4.metric("Avg dwell time",     f"{avg_dwell:.0f}s")
+        c5.metric("Max dwell time",     f"{max_dwell:.0f}s")
+
+        st.divider()
+
+        # ── Row 1: entries/exits per session + door usage ─────────────
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Entries and exits per session")
+            chart_df = sessions_df[["session_id", "total_entries", "total_exits"]].copy()
+            chart_df["session_id"] = chart_df["session_id"].str[-14:]
+            melted = chart_df.melt(
+                id_vars="session_id",
+                value_vars=["total_entries", "total_exits"],
+                var_name="type", value_name="count",
+            )
+            melted["type"] = melted["type"].map({
+                "total_entries": "Entries",
+                "total_exits":   "Exits",
+            })
+            fig = px.bar(
+                melted, x="session_id", y="count", color="type",
+                barmode="group",
+                labels={"session_id": "Session", "count": "Count", "type": ""},
+                color_discrete_map={"Entries": "#1d9e75", "Exits": "#D85A30"},
+            )
+            fig.update_layout(margin=dict(t=10, b=10), height=300, legend=dict(orientation="h"))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            st.subheader("Door usage — entries vs exits")
+            if not door_df.empty:
+                fig = px.bar(
+                    door_df, x="door", y="count", color="event_type",
+                    barmode="group",
+                    labels={"door": "Door", "count": "Count", "event_type": ""},
+                    color_discrete_map={"ENTRY": "#1d9e75", "EXIT": "#D85A30"},
+                )
+                fig.update_layout(margin=dict(t=10, b=10), height=300, legend=dict(orientation="h"))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No door usage data.")
+
+        st.divider()
+
+        # ── Row 2: dwell time histogram + zone transitions ────────────
+        col3, col4 = st.columns(2)
+
+        with col3:
+            st.subheader("Dwell time distribution")
+            if not dwell_df.empty:
+                fig = px.histogram(
+                    dwell_df, x="dwell_time", nbins=8,
+                    labels={"dwell_time": "Dwell time (seconds)", "count": "Sessions"},
+                    color_discrete_sequence=["#534AB7"],
+                )
+                fig.update_layout(margin=dict(t=10, b=10), height=300)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No dwell time data available.")
+
+        with col4:
+            st.subheader("Zone transition paths")
+            if not zone_df.empty:
+                display_zone = zone_df.copy()
+                display_zone["from_zone"] = display_zone["from_zone"].str.split("__").str[-1]
+                display_zone["to_zone"]   = display_zone["to_zone"].str.split("__").str[-1]
+                display_zone.columns      = ["From", "To", "Count"]
+                st.dataframe(display_zone, use_container_width=True, height=300)
+            else:
+                st.info("No zone transitions recorded.")
+
+        st.divider()
+
+        # ── Row 3: data quality ───────────────────────────────────────
+        st.subheader("Data quality — ghost read ratio per session")
+        st.caption(
+            "Proportion of reads that were Out reads while the person was "
+            "confirmed inside. Higher = noisier signal, less reliable events."
+        )
+
+        if "ghost_read_ratio" in sessions_df.columns:
+            ghost_df = sessions_df[
+                ["session_id", "ghost_read_ratio", "entry_rssi_strength"]
+            ].copy()
+            ghost_df["session_id"]      = ghost_df["session_id"].str[-14:]
+            ghost_df["ghost_read_ratio"] = ghost_df["ghost_read_ratio"].fillna(0)
+            ghost_df["entry_rssi_strength"] = ghost_df["entry_rssi_strength"].fillna("unknown")
+
+            fig = px.bar(
+                ghost_df,
+                x="session_id", y="ghost_read_ratio",
+                color="entry_rssi_strength",
+                labels={
+                    "session_id":          "Session",
+                    "ghost_read_ratio":    "Ghost read ratio",
+                    "entry_rssi_strength": "Entry signal strength",
+                },
+                color_discrete_map={
+                    "strong":   "#1d9e75",
+                    "moderate": "#BA7517",
+                    "weak":     "#D85A30",
+                    "unknown":  "#888780",
+                },
+            )
+            fig.update_layout(
+                margin=dict(t=10, b=10), height=280,
+                yaxis_tickformat=".0%",
+                legend=dict(orientation="h"),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 3 — ANOMALIES
+# ═══════════════════════════════════════════════════════════════
+
+with tab3:
+    if anomalies_df.empty:
+        st.success("✅ No anomalies detected across all sessions.")
+    else:
+        # ── Summary metrics ───────────────────────────────────────────
+        total_anom       = len(anomalies_df)
+        flagged_sessions = anomalies_df["session_id"].nunique()
+        clean_sessions   = len(sessions_df) - flagged_sessions
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total anomalies",         total_anom)
+        c2.metric("Sessions with anomalies", flagged_sessions)
+        c3.metric("Clean sessions",          clean_sessions)
+
+        st.divider()
+
+        # ── Charts ────────────────────────────────────────────────────
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Anomalies by type")
+            if not anomaly_sum.empty:
+                fig = px.bar(
+                    anomaly_sum, x="anomaly_type", y="count",
+                    labels={"anomaly_type": "Anomaly type", "count": "Count"},
+                    color_discrete_sequence=["#D85A30"],
+                )
+                fig.update_layout(margin=dict(t=10, b=10), height=300)
+                st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            st.subheader("Anomalies per session")
+            per_session = (
+                anomalies_df.groupby("session_id")["anomaly_type"]
+                .count()
+                .reset_index()
+                .rename(columns={"anomaly_type": "count"})
+            )
+            per_session["session_id"] = per_session["session_id"].str[-14:]
+            fig = px.bar(
+                per_session, x="session_id", y="count",
+                labels={"session_id": "Session", "count": "Anomaly count"},
+                color_discrete_sequence=["#993C1D"],
+            )
+            fig.update_layout(margin=dict(t=10, b=10), height=300)
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+
+        # ── Session overview with anomaly flag ────────────────────────
+        st.subheader("Session overview")
+        overview = sessions_df[[
+            "session_id", "session_date", "total_entries",
+            "total_exits", "total_transitions",
+            "ghost_read_ratio", "entry_rssi_strength", "has_anomaly",
+        ]].copy()
+        overview["has_anomaly"] = overview["has_anomaly"].map({1: "⚠️ Yes", 0: "✅ No"})
+        overview["ghost_read_ratio"] = overview["ghost_read_ratio"].apply(
+            lambda x: f"{float(x):.1%}" if x is not None else "N/A"
+        )
+        overview.columns = [
+            "Session", "Date", "Entries", "Exits",
+            "Transitions", "Ghost ratio", "Entry signal", "Anomaly",
+        ]
+        st.dataframe(overview, use_container_width=True, height=280)
+
+        st.divider()
+
+        # ── Full anomaly log ──────────────────────────────────────────
+        st.subheader("Full anomaly log")
+        log = anomalies_df[["session_id", "epc", "anomaly_type", "t0", "value", "note"]].copy()
+        log["epc"]        = log["epc"].str[-8:]
+        log["session_id"] = log["session_id"].str[-14:]
+        log.columns       = ["Session", "EPC", "Type", "T0 (s)", "Value", "Note"]
+        st.dataframe(log, use_container_width=True, height=400)
