@@ -3,8 +3,8 @@ import openpyxl
 from pathlib import Path
 from typing import Dict, List
 
-from pipeline import run_pipeline_from_rows
-from database import (
+from .pipeline import run_pipeline_from_rows
+from .database import (
     create_schema,
     ingest_raw_reads,
     get_raw_rows,

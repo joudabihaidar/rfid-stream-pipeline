@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import sqlite3
@@ -12,42 +11,37 @@ def main() -> None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
 
-    print("=== raw_reads ===")
-    r = conn.execute("SELECT COUNT(*) as n FROM raw_reads").fetchone()
-    print(f"  total rows: {r['n']}")
-
-    r = conn.execute(
-        "SELECT session_id, COUNT(*) as n FROM raw_reads GROUP BY session_id"
-    ).fetchall()
-    for row in r:
-        print(f"  {row['session_id']:<35} {row['n']} rows")
-
-    print()
     print("=== sessions ===")
-    r = conn.execute(
-        "SELECT session_id, epc, session_date, total_entries, total_exits, total_transitions, has_anomaly FROM sessions"
+    rows = conn.execute(
+        "SELECT session_id, has_anomaly, ghost_read_ratio, entry_rssi_strength FROM sessions"
     ).fetchall()
-    for row in r:
+    for r in rows:
         print(
-            f"  {row['session_id']:<35} date={row['session_date']}  entries={row['total_entries']}  exits={row['total_exits']}  transitions={row['total_transitions']}  anomaly={row['has_anomaly']}"
+            f"  {r['session_id']:<35} has_anomaly={r['has_anomaly']}  "
+            f"ghost_ratio={r['ghost_read_ratio']}  rssi_strength={r['entry_rssi_strength']}"
         )
 
     print()
-    print("=== events ===")
-    r = conn.execute("SELECT COUNT(*) as n FROM events").fetchone()
-    print(f"  total events: {r['n']}")
-    r = conn.execute(
-        "SELECT event_type, COUNT(*) as n FROM events GROUP BY event_type ORDER BY n DESC"
+    print("=== anomalies ===")
+    rows = conn.execute(
+        "SELECT session_id, anomaly_type, t0, value, note FROM anomalies ORDER BY session_id"
     ).fetchall()
-    for row in r:
-        print(f"  {row['event_type']:<25} {row['n']}")
+    if not rows:
+        print("  empty")
+    for r in rows:
+        print(
+            f"  {r['session_id']:<35} {r['anomaly_type']:<30} "
+            f"t0={str(r['t0']):<6} value={r['value']}"
+        )
+        print(f"    note: {r['note']}")
 
     print()
-    print("=== anomalies ===")
-    r = conn.execute("SELECT COUNT(*) as n FROM anomalies").fetchone()
-    print(
-        f"  total anomalies: {r['n']} (empty until analytics/anomaly.py is wired in)"
-    )
+    print("=== anomaly summary ===")
+    rows = conn.execute(
+        "SELECT anomaly_type, COUNT(*) as n FROM anomalies GROUP BY anomaly_type ORDER BY n DESC"
+    ).fetchall()
+    for r in rows:
+        print(f"  {r['anomaly_type']:<30} count={r['n']}")
 
     conn.close()
 
