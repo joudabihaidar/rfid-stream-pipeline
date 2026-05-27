@@ -11,7 +11,10 @@ from database import (
     insert_session,
     insert_events,
     insert_anomalies,
+    update_session_quality,
 )
+from analytics.anomaly import detect_anomalies
+from analytics.quality import compute_data_quality
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EXCEL_PATH   = PROJECT_ROOT / "data" / "raw_data.xlsx"
@@ -60,11 +63,11 @@ def run_all_sheets(file_path: str) -> Dict[str, List[Dict]]:
         print(f"{'═'*60}")
 
         # ── Stage 1: ingest raw reads into DB ────────────────────
-        print("  [1/4] Ingesting raw reads...")
+        print("  [1/5] Ingesting raw reads...")
         ingest_raw_reads(str(file_path), sheet_name)
 
         # ── Stage 2a: read back from DB ──────────────────────────
-        print("  [2/4] Reading from database...")
+        print("  [2/5] Reading from database...")
         db_rows = get_raw_rows(sheet_name)
 
         if not db_rows:
@@ -72,22 +75,24 @@ def run_all_sheets(file_path: str) -> Dict[str, List[Dict]]:
             continue
 
         # ── Stage 2b: run detection pipeline ─────────────────────
-        print("  [3/4] Running detection pipeline...")
+        print("  [3/5] Running detection pipeline...")
         events = run_pipeline_from_rows(db_rows)
 
         if not events:
             print("  No events detected.")
             continue
 
-        # ── Stage 2c: store results ───────────────────────────────
-        # anomaly detection placeholder — returns empty list for now
-        # will be replaced by analytics/anomaly.py tomorrow
-        anomalies = []
+        # ── Stage 2c: detect anomalies and compute quality ───────────
+        print("  [4/5] Detecting anomalies...")
+        anomalies = detect_anomalies(events, db_rows)
+        quality   = compute_data_quality(events, db_rows)
 
-        print("  [4/4] Storing results...")
+        # ── Stage 2d: store results ───────────────────────────────────
+        print("  [5/5] Storing results...")
         insert_session(sheet_name, events, has_anomaly=len(anomalies) > 0)
         insert_events(sheet_name, events)
         insert_anomalies(sheet_name, anomalies)
+        update_session_quality(sheet_name, quality)
 
         all_results[sheet_name] = events
         print()
