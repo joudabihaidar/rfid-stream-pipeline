@@ -91,6 +91,8 @@ def create_schema():
                 total_exits         INTEGER DEFAULT 0,
                 total_transitions   INTEGER DEFAULT 0,
                 has_anomaly         INTEGER DEFAULT 0,
+                ghost_read_ratio    REAL,
+                entry_rssi_strength TEXT,
                 processed_at        TEXT    NOT NULL
             );
 
@@ -121,10 +123,37 @@ def create_schema():
 
         """)
 
+        # Migration: safely add new columns if upgrading from an older schema.
+        # ALTER TABLE in SQLite does not support IF NOT EXISTS,
+        # so we catch the OperationalError that fires when the column exists.
+        migration_cols = [
+            "ALTER TABLE sessions ADD COLUMN ghost_read_ratio    REAL",
+            "ALTER TABLE sessions ADD COLUMN entry_rssi_strength TEXT",
+        ]
+        for stmt in migration_cols:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # column already exists — safe to ignore
 
-# ═══════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════
+
+def update_session_quality(session_id: str, quality: Dict):
+    """
+    Updates the ghost_read_ratio and entry_rssi_strength columns
+    on an existing session row.
+    Called after compute_data_quality() in the processing stage.
+    """
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE sessions
+            SET ghost_read_ratio    = ?,
+                entry_rssi_strength = ?
+            WHERE session_id = ?
+        """, (
+            quality.get("ghost_read_ratio"),
+            quality.get("entry_rssi_strength"),
+            session_id,
+        ))
 
 def session_to_datetime(session_id: str) -> str:
     """
