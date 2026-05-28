@@ -195,7 +195,10 @@ def ingest_raw_reads(file_path: str, sheet_name: str):
     Clears existing rows for this session before inserting so re-running
     is safe and idempotent — you always get a clean slate.
     """
-    from .ingestion import stream_rfid_excel
+    # Keep this import local to avoid openpyxl import cost
+    # when using only DB helpers, but it must be absolute so
+    # `python src/main.py` works (relative imports require a package).
+    from ingestion import stream_rfid_excel
 
     ingested_at = datetime.utcnow().isoformat()
 
