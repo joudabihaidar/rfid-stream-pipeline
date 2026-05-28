@@ -1,3 +1,4 @@
+import time
 from collections import defaultdict
 from typing import Dict, Iterator, List
 
@@ -6,12 +7,12 @@ from ingestion import stream_rfid_excel
 from preprocessing import preprocess_row
 from tracking import EPCTracker, MovementTracker
 
-# ═══════════════════════════════════════════════════════════════
+#  ═══════════════════════════════════════════════════════════════
 # STALE BUFFER FLUSHER
 # ═══════════════════════════════════════════════════════════════
-
+ 
 WINDOW_SIZE = 3  # seconds of silence before a burst is considered closed
-
+ 
 def flush_stale_buffers(
     window_buffer: dict,
     epc_trackers:  dict,
@@ -21,11 +22,11 @@ def flush_stale_buffers(
     """
     Checks every open buffer. If its last row is older than WINDOW_SIZE
     seconds, the burst has ended — aggregate it and send to both trackers.
-
+ 
     Uses session-timeout model: gap measured from LAST row in buffer.
     Sorts flushed bursts by t0_start — earlier Out bursts must be evaluated
     before later In bursts for ghost suppression to work correctly.
-
+ 
     process_event returns a LIST of events ([EXIT, ENTRY] when a real exit
     is immediately followed by re-entry). We iterate over that list.
     """
@@ -35,20 +36,20 @@ def flush_stale_buffers(
         if buf and (current_t0 - buf[-1]["t0"]) > WINDOW_SIZE:
             to_flush.append(aggregate_window(buf))
             del window_buffer[key]
-
+ 
     # Chronological order — required for pending exit ghost logic
     to_flush.sort(key=lambda x: x["t0_start"])
-
+ 
     confirmed = []
     for agg in to_flush:
         epc = agg["epc"]
-
+ 
         building_events = epc_trackers[epc].process_event(agg)
         for building_event in building_events:
             confirmed.append(building_event)
             if building_event["event"] == "EXIT":
                 mov_trackers[epc].reset()
-
+ 
         # Movement reads state AFTER building events update it
         # If EXIT fired above, state=OUTSIDE → movement blocked automatically
         movement_event = mov_trackers[epc].process_event(
@@ -56,27 +57,27 @@ def flush_stale_buffers(
         )
         if movement_event:
             confirmed.append(movement_event)
-
+ 
     return confirmed
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════
 # MAIN PIPELINE
 # ═══════════════════════════════════════════════════════════════
-
+ 
 def run_pipeline(file_path: str, sheet_name: str) -> List[Dict]:
     """
     Full pipeline for one Excel sheet (one test case).
     Reads directly from Excel via stream_rfid_excel.
-
+ 
     Returns all confirmed events (ENTRY, EXIT, ZONE_TRANSITION,
     SESSION_ENDED_INSIDE) sorted chronologically.
-
+ 
     All events are surfaced as-is — including exits before entries,
     zone transitions before entries, and zone transitions after exits.
     These are data anomalies and are preserved intentionally so the
     anomaly detection layer can flag and analyse them.
-
+ 
     Reset between sheets by calling run_pipeline() fresh for each —
     trackers and buffers are local to each call.
     """
@@ -85,20 +86,20 @@ def run_pipeline(file_path: str, sheet_name: str) -> List[Dict]:
             row = preprocess_row(raw_row)
             if row is not None:
                 yield row
-
+ 
     return _process_rows(rows())
-
-
+ 
+ 
 def run_pipeline_from_rows(db_rows: List[Dict]) -> List[Dict]:
     """
     Same pipeline logic as run_pipeline but reads from pre-loaded
     rows sourced from the raw_reads database table (Stage 2 processing).
-
+ 
     This is called after ingest_raw_reads() has already written raw
     rows to the DB. The pipeline logic is identical — only the data
     source changes. This separation means the algorithm can be re-run
     on stored data without touching the Excel file again.
-
+ 
     db_rows must be sorted by t0 ASC, tag_time ASC before calling —
     get_raw_rows() in database.py guarantees this.
     """
@@ -114,10 +115,10 @@ def run_pipeline_from_rows(db_rows: List[Dict]) -> List[Dict]:
                 "rssi":      float(r["rssi"]),
                 "t0":        int(r["t0"]),
             }
-
+ 
     return _process_rows(rows())
-
-
+ 
+ 
 def _process_rows(rows: Iterator[Dict]) -> List[Dict]:
     """
     Core pipeline logic. Accepts an iterator of preprocessed row dicts
@@ -129,23 +130,23 @@ def _process_rows(rows: Iterator[Dict]) -> List[Dict]:
     mov_trackers:  Dict[str, MovementTracker]  = {}
     window_buffer: Dict[tuple, list]           = defaultdict(list)
     all_events:    List[Dict]                  = []
-
+ 
     for row in rows:
-
+ 
         epc = row["epc"]
         key = (epc, row["device"], row["direction"])
-
+ 
         if epc not in epc_trackers:
             epc_trackers[epc] = EPCTracker(epc)
             mov_trackers[epc] = MovementTracker(epc)
-
+ 
         events = flush_stale_buffers(
             window_buffer, epc_trackers, mov_trackers, row["t0"]
         )
         all_events.extend(events)
-
+ 
         window_buffer[key].append(row)
-
+ 
     # End of stream: flush all remaining open buffers in chronological order
     remaining = sorted(
         [aggregate_window(buf) for buf in window_buffer.values() if buf],
@@ -153,25 +154,25 @@ def _process_rows(rows: Iterator[Dict]) -> List[Dict]:
     )
     for agg in remaining:
         epc = agg["epc"]
-
+ 
         building_events = epc_trackers[epc].process_event(agg)
         for building_event in building_events:
             all_events.append(building_event)
             if building_event["event"] == "EXIT":
                 mov_trackers[epc].reset()
-
+ 
         movement_event = mov_trackers[epc].process_event(
             agg, epc_trackers[epc].state
         )
         if movement_event:
             all_events.append(movement_event)
-
+ 
     # Confirm any exits still pending at end of stream
     for epc, tracker in epc_trackers.items():
         exit_event = tracker.flush_pending_exit()
         if exit_event:
             all_events.append(exit_event)
-
+ 
     # Flag sessions that ended without a confirmed exit.
     # Covers INSIDE (entry confirmed, no exit) and UNKNOWN (only exits
     # recorded with no entry — exit events still surface with dwell_time=None).
@@ -183,9 +184,114 @@ def _process_rows(rows: Iterator[Dict]) -> List[Dict]:
                 "t0":    None,
                 "note":  "Stream ended before exit was detected — possible data gap or anomaly"
             })
-
+ 
     # Sort all events chronologically by t0.
     # SESSION_ENDED_INSIDE has t0=None — pushed to the end.
     all_events.sort(key=lambda e: e["t0"] if e["t0"] is not None else float("inf"))
-
+ 
     return all_events
+ 
+ 
+# ═══════════════════════════════════════════════════════════════
+# REAL-TIME STREAMING (for dashboard live replay)
+# ═══════════════════════════════════════════════════════════════
+ 
+def stream_pipeline_events_from_rows(
+    db_rows: List[Dict],
+    delay:   float = 0.0,
+) -> Iterator[Dict]:
+    """
+    Same detection logic as run_pipeline_from_rows but yields events
+    one by one as they are detected — not all at once at the end.
+ 
+    Used by the dashboard for genuine real-time replay:
+        - Rows are fed into the pipeline one at a time
+        - A delay is applied between each row (simulating a live stream)
+        - Events are yielded the moment the algorithm confirms them
+        - The dashboard has no idea what events are coming next
+ 
+    This is fundamentally different from replaying stored events —
+    the pipeline is actually running, not just animating a results list.
+ 
+    Each yielded dict includes both "event" and "event_type" keys
+    so it works seamlessly with both pipeline and dashboard conventions.
+ 
+    Args:
+        db_rows: rows from get_raw_rows() — sorted by t0, tag_time ASC
+        delay:   seconds to wait between each raw row (0 = as fast as possible)
+    """
+    epc_trackers:  Dict[str, EPCTracker]      = {}
+    mov_trackers:  Dict[str, MovementTracker]  = {}
+    window_buffer: Dict[tuple, list]           = defaultdict(list)
+ 
+    def _yield_event(event: Dict) -> Dict:
+        """Normalise event dict so both 'event' and 'event_type' keys exist."""
+        event_type = event.get("event", event.get("event_type", ""))
+        return {**event, "event": event_type, "event_type": event_type}
+ 
+    for r in db_rows:
+        row = {
+            "epc":       r["epc"],
+            "device":    r["base_logical_device"],
+            "direction": r["direction"],
+            "door":      r["door"],
+            "rssi":      float(r["rssi"]),
+            "t0":        int(r["t0"]),
+        }
+ 
+        epc = row["epc"]
+        key = (epc, row["device"], row["direction"])
+ 
+        if epc not in epc_trackers:
+            epc_trackers[epc] = EPCTracker(epc)
+            mov_trackers[epc] = MovementTracker(epc)
+ 
+        # Flush stale buffers — yield any confirmed events immediately
+        confirmed = flush_stale_buffers(
+            window_buffer, epc_trackers, mov_trackers, row["t0"]
+        )
+        for event in confirmed:
+            yield _yield_event(event)
+ 
+        window_buffer[key].append(row)
+ 
+        if delay > 0:
+            time.sleep(delay)
+ 
+    # End of stream: flush all remaining open buffers
+    remaining = sorted(
+        [aggregate_window(buf) for buf in window_buffer.values() if buf],
+        key=lambda x: x["t0_start"]
+    )
+    for agg in remaining:
+        epc = agg["epc"]
+ 
+        building_events = epc_trackers[epc].process_event(agg)
+        for building_event in building_events:
+            yield _yield_event(building_event)
+            if building_event["event"] == "EXIT":
+                mov_trackers[epc].reset()
+ 
+        movement_event = mov_trackers[epc].process_event(
+            agg, epc_trackers[epc].state
+        )
+        if movement_event:
+            yield _yield_event(movement_event)
+ 
+    # Confirm any exits still pending at end of stream
+    for epc, tracker in epc_trackers.items():
+        exit_event = tracker.flush_pending_exit()
+        if exit_event:
+            yield _yield_event(exit_event)
+ 
+    # Flag sessions that ended without a confirmed exit
+    for epc, tracker in epc_trackers.items():
+        if tracker.state in ("INSIDE", "UNKNOWN"):
+            yield _yield_event({
+                "epc":        epc,
+                "event":      "SESSION_ENDED_INSIDE",
+                "event_type": "SESSION_ENDED_INSIDE",
+                "t0":         None,
+                "note":       "Stream ended before exit was detected — possible data gap or anomaly",
+            })
+ 
