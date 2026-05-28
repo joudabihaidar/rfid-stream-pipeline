@@ -1,5 +1,6 @@
 # dashboard/app.py
 import sys
+import logging
 import time
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from src.database import (
 from src.pipeline import stream_pipeline_events_from_rows
 
 EXCEL_PATH = str(PROJECT_ROOT / "data" / "raw_data.xlsx")
+LOG_PATH   = PROJECT_ROOT / "data" / "pipeline.log"
 
 # ═══════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -38,7 +40,33 @@ st.set_page_config(
 )
 
 # ═══════════════════════════════════════════════════════════════
-# DATA LOADING (cached)
+# STREAMLIT LOG HANDLER
+# Writes pipeline log lines into a Streamlit placeholder in real time
+# ═══════════════════════════════════════════════════════════════
+
+class StreamlitLogHandler(logging.Handler):
+    """
+    Custom logging handler that appends log lines to a Streamlit
+    st.empty() placeholder as the pipeline runs.
+    Only shows the last MAX_LINES lines so the box doesn't grow forever.
+    """
+    MAX_LINES = 60
+
+    def __init__(self, placeholder):
+        super().__init__()
+        self.placeholder = placeholder
+        self.lines       = []
+
+    def emit(self, record):
+        self.lines.append(self.format(record))
+        self.placeholder.code(
+            "\n".join(self.lines[-self.MAX_LINES:]),
+            language="log",
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# DATA LOADING (cached — refreshes every 60 seconds)
 # ═══════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=60)
@@ -104,18 +132,21 @@ with st.sidebar:
         step=0.01,
         help="Lower = faster. At 0.05s a 100-row session takes ~5 seconds.",
     )
-    start_replay = st.button("▶ Start Replay", use_container_width=True, type="primary")
+    start_replay = st.button(
+        "▶ Start Replay",
+        use_container_width=True,
+        type="primary",
+    )
 
     st.divider()
     total_events    = int(sessions_df["total_entries"].sum() + sessions_df["total_exits"].sum()) if not sessions_df.empty else 0
     total_anomalies = len(anomalies_df) if not anomalies_df.empty else 0
-    st.caption(f"{len(sessions_df)} sessions · {total_events} events · {total_anomalies} anomalies")
+    st.caption(
+        f"{len(sessions_df)} sessions · "
+        f"{total_events} events · "
+        f"{total_anomalies} anomalies"
+    )
 
-# ═══════════════════════════════════════════════════════════════
-# TABS
-# ═══════════════════════════════════════════════════════════════
-
-tab1, tab2, tab3 = st.tabs(["📡 Live Feed", "📊 Access Patterns", "⚠️ Anomalies"])
 
 # ═══════════════════════════════════════════════════════════════
 # SHARED RENDER HELPERS
@@ -150,7 +181,6 @@ def render_feed(displayed_events, feed_area):
         "dwell_time": "Dwell (s)",
     }
     df = df.rename(columns=rename)
-
     for col in ["From zone", "To zone"]:
         if col in df.columns:
             df[col] = df[col].str.split("__").str[-1]
@@ -163,6 +193,18 @@ def render_feed(displayed_events, feed_area):
 
 
 # ═══════════════════════════════════════════════════════════════
+# TABS
+# ═══════════════════════════════════════════════════════════════
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📡 Live Feed",
+    "📊 Access Patterns",
+    "⚠️ Anomalies",
+    "⚙️ Pipeline",
+])
+
+
+# ═══════════════════════════════════════════════════════════════
 # TAB 1 — LIVE FEED
 # ═══════════════════════════════════════════════════════════════
 
@@ -170,7 +212,9 @@ with tab1:
     if not selected_session:
         st.info("Select a session from the sidebar.")
     else:
-        session_row = sessions_df[sessions_df["session_id"] == selected_session].iloc[0]
+        session_row = sessions_df[
+            sessions_df["session_id"] == selected_session
+        ].iloc[0]
 
         st.subheader(f"Session: {selected_session}")
         st.caption(
@@ -185,43 +229,40 @@ with tab1:
         st.markdown("**Event log**")
         feed_area = st.empty()
 
-        # Pre-load anomaly info for this session (for toast triggers)
+        # Pre-load anomaly info for this session
         session_anomalies = (
             anomalies_df[anomalies_df["session_id"] == selected_session]
             if not anomalies_df.empty else pd.DataFrame()
         )
-        n_anomalies  = len(session_anomalies)
-        anomaly_t0s  = set(
+        n_anomalies = len(session_anomalies)
+        anomaly_t0s = set(
             session_anomalies["t0"].dropna().astype(int).tolist()
-        ) if not session_anomalies.empty else set()
-        anomaly_types = set(
-            session_anomalies["anomaly_type"].tolist()
         ) if not session_anomalies.empty else set()
 
         if start_replay:
             # ── Real-time replay ──────────────────────────────────────
-            # Loads raw rows from DB, feeds them one by one into the
-            # pipeline with a delay. Events are yielded the moment
-            # the algorithm confirms them — not all at once.
+            # Feeds raw rows from DB one by one into the pipeline.
+            # Events are yielded the moment the algorithm confirms them.
             db_rows   = get_raw_rows(selected_session)
             displayed = []
 
-            for event in stream_pipeline_events_from_rows(db_rows, delay=replay_speed):
+            for event in stream_pipeline_events_from_rows(
+                db_rows, delay=replay_speed
+            ):
                 displayed.append(event)
                 render_metrics(displayed, metrics_area, n_anomalies)
                 render_feed(displayed, feed_area)
 
-                # Fire toast when anomaly event detected
                 event_type = event.get("event_type", "")
                 t0_val     = event.get("t0")
 
                 if event_type == "SESSION_ENDED_INSIDE":
                     st.toast("⚠️ Session ended inside — no exit detected", icon="🚨")
                 elif t0_val is not None and int(t0_val) in anomaly_t0s:
-                    st.toast(f"⚠️ {event_type} at T0={t0_val}", icon="🚨")
+                    st.toast(f"⚠️ {event_type} detected at T0={t0_val}", icon="🚨")
 
         else:
-            # ── Static view (before replay starts) ───────────────────
+            # ── Static view before replay ─────────────────────────────
             session_events = get_events_for_session(selected_session)
             if session_events:
                 normalized = [
@@ -231,7 +272,8 @@ with tab1:
                 render_metrics(normalized, metrics_area, n_anomalies)
                 render_feed(normalized, feed_area)
             else:
-                st.info("No events found for this session.")
+                st.info("No events found. Run the pipeline first.")
+
 
 # ═══════════════════════════════════════════════════════════════
 # TAB 2 — ACCESS PATTERNS
@@ -239,7 +281,7 @@ with tab1:
 
 with tab2:
     if sessions_df.empty:
-        st.info("No data available. Run main.py first.")
+        st.info("No data available. Run the pipeline from the ⚙️ Pipeline tab.")
     else:
         total_entries     = int(sessions_df["total_entries"].sum())
         total_exits       = int(sessions_df["total_exits"].sum())
@@ -260,7 +302,9 @@ with tab2:
 
         with col1:
             st.subheader("Entries and exits per session")
-            chart_df = sessions_df[["session_id", "total_entries", "total_exits"]].copy()
+            chart_df = sessions_df[
+                ["session_id", "total_entries", "total_exits"]
+            ].copy()
             chart_df["session_id"] = chart_df["session_id"].str[-14:]
             melted = chart_df.melt(
                 id_vars="session_id",
@@ -272,22 +316,30 @@ with tab2:
                 "total_exits":   "Exits",
             })
             fig = px.bar(
-                melted, x="session_id", y="count", color="type", barmode="group",
+                melted, x="session_id", y="count",
+                color="type", barmode="group",
                 labels={"session_id": "Session", "count": "Count", "type": ""},
                 color_discrete_map={"Entries": "#1d9e75", "Exits": "#D85A30"},
             )
-            fig.update_layout(margin=dict(t=10, b=10), height=300, legend=dict(orientation="h"))
+            fig.update_layout(
+                margin=dict(t=10, b=10), height=300,
+                legend=dict(orientation="h"),
+            )
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
             st.subheader("Door usage — entries vs exits")
             if not door_df.empty:
                 fig = px.bar(
-                    door_df, x="door", y="count", color="event_type", barmode="group",
+                    door_df, x="door", y="count",
+                    color="event_type", barmode="group",
                     labels={"door": "Door", "count": "Count", "event_type": ""},
                     color_discrete_map={"ENTRY": "#1d9e75", "EXIT": "#D85A30"},
                 )
-                fig.update_layout(margin=dict(t=10, b=10), height=300, legend=dict(orientation="h"))
+                fig.update_layout(
+                    margin=dict(t=10, b=10), height=300,
+                    legend=dict(orientation="h"),
+                )
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("No door usage data.")
@@ -301,7 +353,10 @@ with tab2:
             if not dwell_df.empty:
                 fig = px.histogram(
                     dwell_df, x="dwell_time", nbins=8,
-                    labels={"dwell_time": "Dwell time (seconds)", "count": "Sessions"},
+                    labels={
+                        "dwell_time": "Dwell time (seconds)",
+                        "count":      "Sessions",
+                    },
                     color_discrete_sequence=["#534AB7"],
                 )
                 fig.update_layout(margin=dict(t=10, b=10), height=300)
@@ -313,9 +368,13 @@ with tab2:
             st.subheader("Zone transition paths")
             if not zone_df.empty:
                 display_zone = zone_df.copy()
-                display_zone["from_zone"] = display_zone["from_zone"].str.split("__").str[-1]
-                display_zone["to_zone"]   = display_zone["to_zone"].str.split("__").str[-1]
-                display_zone.columns      = ["From", "To", "Count"]
+                display_zone["from_zone"] = (
+                    display_zone["from_zone"].str.split("__").str[-1]
+                )
+                display_zone["to_zone"] = (
+                    display_zone["to_zone"].str.split("__").str[-1]
+                )
+                display_zone.columns = ["From", "To", "Count"]
                 st.dataframe(display_zone, width="stretch", height=300)
             else:
                 st.info("No zone transitions recorded.")
@@ -328,13 +387,14 @@ with tab2:
             "was confirmed inside. Higher = noisier signal."
         )
         if "ghost_read_ratio" in sessions_df.columns:
-            ghost_df = sessions_df[
-                ["session_id", "ghost_read_ratio", "entry_rssi_strength"]
-            ].copy()
-            ghost_df["session_id"]           = ghost_df["session_id"].str[-14:]
-            ghost_df["ghost_read_ratio"]     = ghost_df["ghost_read_ratio"].fillna(0)
-            ghost_df["entry_rssi_strength"]  = ghost_df["entry_rssi_strength"].fillna("unknown")
-
+            ghost_df = sessions_df[[
+                "session_id", "ghost_read_ratio", "entry_rssi_strength"
+            ]].copy()
+            ghost_df["session_id"] = ghost_df["session_id"].str[-14:]
+            ghost_df["ghost_read_ratio"] = ghost_df["ghost_read_ratio"].fillna(0)
+            ghost_df["entry_rssi_strength"] = (
+                ghost_df["entry_rssi_strength"].fillna("unknown")
+            )
             fig = px.bar(
                 ghost_df,
                 x="session_id", y="ghost_read_ratio",
@@ -357,6 +417,7 @@ with tab2:
                 legend=dict(orientation="h"),
             )
             st.plotly_chart(fig, use_container_width=True)
+
 
 # ═══════════════════════════════════════════════════════════════
 # TAB 3 — ANOMALIES
@@ -384,7 +445,10 @@ with tab3:
             if not anomaly_sum.empty:
                 fig = px.bar(
                     anomaly_sum, x="anomaly_type", y="count",
-                    labels={"anomaly_type": "Anomaly type", "count": "Count"},
+                    labels={
+                        "anomaly_type": "Anomaly type",
+                        "count":        "Count",
+                    },
                     color_discrete_sequence=["#D85A30"],
                 )
                 fig.update_layout(margin=dict(t=10, b=10), height=300)
@@ -412,9 +476,12 @@ with tab3:
         st.subheader("Session overview")
         overview = sessions_df[[
             "session_id", "session_date", "total_entries", "total_exits",
-            "total_transitions", "ghost_read_ratio", "entry_rssi_strength", "has_anomaly",
+            "total_transitions", "ghost_read_ratio",
+            "entry_rssi_strength", "has_anomaly",
         ]].copy()
-        overview["has_anomaly"] = overview["has_anomaly"].map({1: "⚠️ Yes", 0: "✅ No"})
+        overview["has_anomaly"] = overview["has_anomaly"].map(
+            {1: "⚠️ Yes", 0: "✅ No"}
+        )
         overview["ghost_read_ratio"] = overview["ghost_read_ratio"].apply(
             lambda x: f"{float(x):.1%}" if x is not None else "N/A"
         )
@@ -427,8 +494,153 @@ with tab3:
         st.divider()
 
         st.subheader("Full anomaly log")
-        log = anomalies_df[["session_id", "epc", "anomaly_type", "t0", "value", "note"]].copy()
+        log = anomalies_df[[
+            "session_id", "epc", "anomaly_type", "t0", "value", "note"
+        ]].copy()
         log["epc"]        = log["epc"].str[-8:]
         log["session_id"] = log["session_id"].str[-14:]
         log.columns       = ["Session", "EPC", "Type", "T0 (s)", "Value", "Note"]
         st.dataframe(log, width="stretch", height=400)
+
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 4 — PIPELINE
+# ═══════════════════════════════════════════════════════════════
+
+with tab4:
+    st.subheader("Run pipeline")
+    st.caption(
+        "For each session (Excel sheet): "
+        "**Stage 1** extracts raw RFID reads into the database · "
+        "**Stage 2** runs the detection algorithm · "
+        "**Stage 3** detects anomalies and computes data quality · "
+        "**Stage 4** stores all results. "
+        "Metrics update after each session. Logs stream in real time."
+    )
+
+    run_btn = st.button(
+        "▶ Run full pipeline",
+        type="primary",
+        use_container_width=True,
+    )
+
+    if run_btn:
+        import openpyxl
+        from src.main     import process_sheet
+        from src.database import create_schema
+
+        # ── Live metric placeholders ──────────────────────────────
+        st.markdown("**Live progress**")
+        m1, m2, m3, m4 = st.columns(4)
+        entries_box    = m1.empty()
+        exits_box      = m2.empty()
+        anomalies_box  = m3.empty()
+        sessions_box   = m4.empty()
+
+        entries_box.metric("Entries detected",    0)
+        exits_box.metric("Exits detected",        0)
+        anomalies_box.metric("Anomalies found",   0)
+        sessions_box.metric("Sessions processed", "0 / ?")
+
+        # ── Live log placeholder ──────────────────────────────────
+        st.markdown("**Live logs**")
+        log_placeholder = st.empty()
+
+        # ── Attach logging handlers ───────────────────────────────
+        # StreamlitLogHandler → updates the placeholder in real time
+        # FileHandler         → writes to pipeline.log
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        streamlit_handler = StreamlitLogHandler(log_placeholder)
+        file_handler      = logging.FileHandler(LOG_PATH, encoding="utf-8")
+
+        formatter = logging.Formatter(
+            "%(asctime)s  %(levelname)-8s  %(message)s",
+            datefmt="%H:%M:%S",
+        )
+        streamlit_handler.setFormatter(formatter)
+        file_handler.setFormatter(formatter)
+
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.DEBUG)
+        root_logger.addHandler(streamlit_handler)
+        root_logger.addHandler(file_handler)
+        logging.getLogger("openpyxl").setLevel(logging.WARNING)
+
+        # ── Run pipeline session by session via process_sheet ─────
+        # process_sheet() is the exact same function main.py uses —
+        # one source of truth, identical logic, identical logs.
+        create_schema()
+
+        try:
+            wb          = openpyxl.load_workbook(EXCEL_PATH, read_only=True)
+            sheet_names = wb.sheetnames
+            wb.close()
+        except Exception as e:
+            st.error(f"Could not open Excel file: {e}")
+            sheet_names = []
+
+        total_entries   = 0
+        total_exits     = 0
+        total_anomalies = 0
+
+        for i, sheet_name in enumerate(sheet_names, start=1):
+            sessions_box.metric(
+                "Sessions processed",
+                f"{i - 1} / {len(sheet_names)}",
+            )
+
+            # Single call — same function, same logic, same logs as main.py
+            events, anomalies = process_sheet(str(EXCEL_PATH), sheet_name)
+
+            total_entries   += sum(1 for e in events if e.get("event") == "ENTRY")
+            total_exits     += sum(1 for e in events if e.get("event") == "EXIT")
+            total_anomalies += len(anomalies)
+
+            entries_box.metric("Entries detected",    total_entries)
+            exits_box.metric("Exits detected",        total_exits)
+            anomalies_box.metric("Anomalies found",   total_anomalies)
+            sessions_box.metric(
+                "Sessions processed",
+                f"{i} / {len(sheet_names)}",
+            )
+
+        # Detach handlers
+        root_logger.removeHandler(streamlit_handler)
+        root_logger.removeHandler(file_handler)
+        file_handler.close()
+
+        st.success(
+            f"✅ Pipeline complete — "
+            f"{len(sheet_names)} sessions · "
+            f"{total_entries} entries · "
+            f"{total_exits} exits · "
+            f"{total_anomalies} anomalies"
+        )
+
+        st.cache_data.clear()
+        time.sleep(1)
+        st.rerun()
+
+    # ── Log file viewer ───────────────────────────────────────────
+    st.divider()
+    st.subheader("Pipeline log file")
+    st.caption(f"Path: data/pipeline.log")
+
+    if LOG_PATH.exists():
+        log_text = LOG_PATH.read_text(encoding="utf-8")
+        lines    = log_text.strip().split("\n")
+
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            n_lines = st.selectbox(
+                "Show last N lines",
+                options=[50, 100, 200, 500],
+                index=0,
+            )
+        with col1:
+            st.caption(f"{len(lines)} total lines in log file")
+
+        st.code("\n".join(lines[-n_lines:]), language="log")
+    else:
+        st.info("No log file yet. Run the pipeline first.")

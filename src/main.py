@@ -1,14 +1,8 @@
 # src/main.py
 import logging
-import sys
 import openpyxl
 from pathlib import Path
 from typing import Dict, List
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# Allow imports from repo root (e.g. analytics/) when running `python src/main.py`
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline import run_pipeline_from_rows
 from database import (
@@ -23,6 +17,7 @@ from database import (
 from analytics.anomaly import detect_anomalies
 from analytics.quality import compute_data_quality
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EXCEL_PATH   = PROJECT_ROOT / "data" / "raw_data.xlsx"
 LOG_PATH     = PROJECT_ROOT / "data" / "pipeline.log"
 
@@ -85,60 +80,59 @@ def print_events(events: List[Dict]):
 # PIPELINE
 # ═══════════════════════════════════════════════════════════════
 
-def process_sheet(file_path: str, sheet_name: str) -> List[Dict]:
+def process_sheet(file_path: str, sheet_name: str) -> tuple:
     """
-    Runs the full two-stage pipeline for a single sheet.
+    Runs the full two-stage pipeline for a single session (Excel sheet).
 
     Stage 1 — Ingestion:
-        Raw RFID rows are streamed from Excel and written to the
+        Raw RFID reads are streamed from Excel and written to the
         raw_reads table exactly as received. No transformation.
 
     Stage 2 — Processing:
         Raw rows are read back from the DB, run through the detection
         algorithm, and the resulting events and anomalies are stored.
 
-    Returns the list of confirmed events, or an empty list on failure.
-    Raises no exceptions — all errors are logged and the sheet is skipped.
+    Returns (events, anomalies) — both lists.
+    Returns ([], []) on failure — errors are logged, session is skipped.
     """
 
-    # ── Stage 1: ingest raw reads ─────────────────────────────────
-    log.info(f"[{sheet_name}] [1/5] Ingesting raw reads...")
+    # ── Stage 1: extract raw RFID reads into DB ───────────────────
+    log.info(f"[{sheet_name}] [1/4] Extracting raw RFID reads into database...")
     try:
         ingest_raw_reads(file_path, sheet_name)
     except Exception as e:
         log.error(f"[{sheet_name}] Ingestion failed: {e}")
-        return []
+        return [], []
 
-    # ── Stage 2a: read back from DB ───────────────────────────────
-    log.info(f"[{sheet_name}] [2/5] Reading from database...")
+    # ── Stage 2: read back from DB ────────────────────────────────
     try:
         db_rows = get_raw_rows(sheet_name)
     except Exception as e:
         log.error(f"[{sheet_name}] DB read failed: {e}")
-        return []
+        return [], []
 
     if not db_rows:
         log.warning(f"[{sheet_name}] No rows found after ingestion — skipping.")
-        return []
+        return [], []
 
-    log.debug(f"[{sheet_name}] {len(db_rows)} raw rows loaded from DB.")
+    log.debug(f"[{sheet_name}] {len(db_rows)} raw reads loaded from DB.")
 
-    # ── Stage 2b: run detection pipeline ─────────────────────────
-    log.info(f"[{sheet_name}] [3/5] Running detection pipeline...")
+    # ── Stage 3: run detection pipeline ──────────────────────────
+    log.info(f"[{sheet_name}] [2/4] Running detection pipeline...")
     try:
         events = run_pipeline_from_rows(db_rows)
     except Exception as e:
         log.error(f"[{sheet_name}] Pipeline failed: {e}")
-        return []
+        return [], []
 
     if not events:
         log.warning(f"[{sheet_name}] No events detected.")
-        return []
+        return [], []
 
     log.debug(f"[{sheet_name}] {len(events)} events detected.")
 
-    # ── Stage 2c: detect anomalies + compute quality ──────────────
-    log.info(f"[{sheet_name}] [4/5] Detecting anomalies...")
+    # ── Stage 4: detect anomalies + compute quality ───────────────
+    log.info(f"[{sheet_name}] [3/4] Detecting anomalies...")
     try:
         anomalies = detect_anomalies(events, db_rows)
         quality   = compute_data_quality(events, db_rows)
@@ -148,13 +142,13 @@ def process_sheet(file_path: str, sheet_name: str) -> List[Dict]:
         quality   = {}
 
     log.debug(
-        f"[{sheet_name}] {len(anomalies)} anomalies detected. "
+        f"[{sheet_name}] {len(anomalies)} anomalies. "
         f"Ghost ratio: {quality.get('ghost_read_ratio')}  "
         f"Entry signal: {quality.get('entry_rssi_strength')}"
     )
 
-    # ── Stage 2d: store results ───────────────────────────────────
-    log.info(f"[{sheet_name}] [5/5] Storing results...")
+    # ── Stage 5: store results ────────────────────────────────────
+    log.info(f"[{sheet_name}] [4/4] Storing results...")
     try:
         insert_session(sheet_name, events, has_anomaly=len(anomalies) > 0)
         insert_events(sheet_name, events)
@@ -162,23 +156,26 @@ def process_sheet(file_path: str, sheet_name: str) -> List[Dict]:
         update_session_quality(sheet_name, quality)
     except Exception as e:
         log.error(f"[{sheet_name}] DB write failed: {e}")
-        return []
+        return [], []
 
-    log.info(f"[{sheet_name}] Done — {len(events)} events, {len(anomalies)} anomalies.")
-    return events
+    log.info(
+        f"[{sheet_name}] ✓ Done — "
+        f"{len(events)} events, {len(anomalies)} anomalies."
+    )
+    return events, anomalies
 
 
 def run_all_sheets(file_path: str) -> Dict[str, List[Dict]]:
     """
-    Runs the full pipeline for every sheet in the workbook.
-    Sheets that fail are logged and skipped — one bad sheet
+    Runs the full pipeline for every session (sheet) in the workbook.
+    Sessions that fail are logged and skipped — one bad session
     does not stop the rest from processing.
 
-    Returns a dict of {session_id: events} for all successful sheets.
+    Returns a dict of {session_id: events} for all successful sessions.
     """
     log.info(f"Opening workbook: {file_path}")
     try:
-        wb = openpyxl.load_workbook(file_path, read_only=True)
+        wb          = openpyxl.load_workbook(file_path, read_only=True)
         sheet_names = wb.sheetnames
         wb.close()
     except FileNotFoundError:
@@ -188,23 +185,22 @@ def run_all_sheets(file_path: str) -> Dict[str, List[Dict]]:
         log.error(f"Failed to open workbook: {e}")
         return {}
 
-    log.info(f"Found {len(sheet_names)} sheets: {sheet_names}")
+    log.info(f"Found {len(sheet_names)} sessions: {sheet_names}")
     all_results = {}
 
     for sheet_name in sheet_names:
-        # Use ASCII separators so Windows cp1252 consoles don't crash
-        print("\n" + "=" * 60)
-        print(f"  Processing sheet: {sheet_name}")
-        print("=" * 60)
+        print(f"\n{'═'*60}")
+        print(f"  Processing session: {sheet_name}")
+        print(f"{'═'*60}")
 
-        events = process_sheet(str(file_path), sheet_name)
+        events, anomalies = process_sheet(str(file_path), sheet_name)
 
         if events:
             all_results[sheet_name] = events
             print()
             print_events(events)
         else:
-            print(f"  ✗ Sheet skipped — see log for details.")
+            print(f"  ✗ Session skipped — see log for details.")
 
     return all_results
 
@@ -225,15 +221,15 @@ if __name__ == "__main__":
 
     results = run_all_sheets(EXCEL_PATH)
 
-    print("\n" + "=" * 60)
-    print("  SUMMARY")
-    print("=" * 60)
+    print(f"\n{'═'*60}")
+    print(f"  SUMMARY")
+    print(f"{'═'*60}")
     for session, events in results.items():
-        entries = sum(1 for e in events if e["event"] == "ENTRY")
-        exits   = sum(1 for e in events if e["event"] == "EXIT")
-        flags   = sum(1 for e in events if e["event"] == "SESSION_ENDED_INSIDE")
+        entries   = sum(1 for e in events if e["event"] == "ENTRY")
+        exits     = sum(1 for e in events if e["event"] == "EXIT")
+        flags     = sum(1 for e in events if e["event"] == "SESSION_ENDED_INSIDE")
         print(f"  {session:<35}  entries={entries}  exits={exits}  flags={flags}")
 
     print(f"\n  Database: {PROJECT_ROOT / 'data' / 'rfid_events.db'}")
     print(f"  Log file: {LOG_PATH}")
-    log.info(f"Pipeline finished. {len(results)} sheets processed successfully.")
+    log.info(f"Pipeline finished. {len(results)} sessions processed successfully.")
