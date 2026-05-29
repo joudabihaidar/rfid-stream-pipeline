@@ -1,4 +1,3 @@
-# dashboard/app.py
 import sys
 import logging
 import time

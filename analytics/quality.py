@@ -1,4 +1,3 @@
-# analytics/quality.py
 from typing import List, Dict, Optional
 
 # ── Tunable thresholds ────────────────────────────────────────────────────────

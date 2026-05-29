@@ -1,4 +1,3 @@
-# src/main.py
 import logging
 import openpyxl
 from pathlib import Path
