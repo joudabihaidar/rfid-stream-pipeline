@@ -17,10 +17,21 @@ def get_connection() -> sqlite3.Connection:
     row_factory=sqlite3.Row makes rows behave like dicts —
     access columns by name instead of index.
     Creates the data/ directory if it doesn't exist yet.
+
+    WAL (Write-Ahead Logging) mode is enabled so multiple readers
+    can query the database while the streaming pipeline is writing.
+    Without WAL, writes lock the entire file — the dashboard would
+    get "database is locked" errors during streaming ingestion.
     """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+
+    # WAL: writers go to a separate log file, readers read the main file
+    conn.execute("PRAGMA journal_mode=WAL")
+    # NORMAL sync: safe with WAL, much faster than FULL
+    conn.execute("PRAGMA synchronous=NORMAL")
+
     return conn
 
 
@@ -92,6 +103,7 @@ def create_schema():
                 has_anomaly         INTEGER DEFAULT 0,
                 ghost_read_ratio    REAL,
                 entry_rssi_strength TEXT,
+                ml_score            REAL,
                 processed_at        TEXT    NOT NULL
             );
 
@@ -128,6 +140,7 @@ def create_schema():
         migration_cols = [
             "ALTER TABLE sessions ADD COLUMN ghost_read_ratio    REAL",
             "ALTER TABLE sessions ADD COLUMN entry_rssi_strength TEXT",
+            "ALTER TABLE sessions ADD COLUMN ml_score            REAL",
         ]
         for stmt in migration_cols:
             try:
@@ -153,6 +166,19 @@ def update_session_quality(session_id: str, quality: Dict):
             quality.get("entry_rssi_strength"),
             session_id,
         ))
+
+
+def update_session_ml(session_id: str, ml_score: float):
+    """
+    Updates the ml_score column on an existing session row.
+    Called after run_ml() completes for all sessions.
+    """
+    with get_connection() as conn:
+        conn.execute("""
+            UPDATE sessions
+            SET ml_score = ?
+            WHERE session_id = ?
+        """, (ml_score, session_id))
 
 def session_to_datetime(session_id: str) -> str:
     """
@@ -194,10 +220,7 @@ def ingest_raw_reads(file_path: str, sheet_name: str):
     Clears existing rows for this session before inserting so re-running
     is safe and idempotent — you always get a clean slate.
     """
-    # Keep this import local to avoid openpyxl import cost
-    # when using only DB helpers, but it must be absolute so
-    # `python src/main.py` works (relative imports require a package).
-    from ingestion import stream_rfid_excel
+    from .ingestion import stream_rfid_excel
 
     ingested_at = datetime.utcnow().isoformat()
 
@@ -438,3 +461,115 @@ def get_anomaly_summary() -> List[Dict]:
             ORDER BY count DESC
         """).fetchall()
     return [dict(r) for r in rows]
+
+
+# ═══════════════════════════════════════════════════════════════
+# STREAMING — row-by-row writes for real-time mode
+# ═══════════════════════════════════════════════════════════════
+
+def clear_session_data(session_id: str):
+    """
+    Clears all data for a session before re-streaming it.
+    Called at the start of each session in streaming mode so
+    re-runs don't accumulate duplicate data.
+    """
+    with get_connection() as conn:
+        conn.execute("DELETE FROM raw_reads  WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM events     WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM anomalies  WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM sessions   WHERE session_id = ?", (session_id,))
+
+
+def ingest_single_row(session_id: str, raw_row: Dict):
+    """
+    Writes a single raw RFID read to the database immediately.
+    Called for every row as it arrives from stream_rfid_excel().
+
+    Also creates the session row if it doesn't exist yet
+    (INSERT OR IGNORE means safe to call on every row).
+
+    This is the streaming equivalent of ingest_raw_reads() —
+    instead of ingesting a whole sheet at once, we ingest one
+    row at a time so the dashboard can see data arriving live.
+    """
+    epc          = str(raw_row.get("epc", "")).strip()
+    session_date = session_to_datetime(session_id)
+
+    with get_connection() as conn:
+        # Create session row on first raw read for this session
+        conn.execute("""
+            INSERT OR IGNORE INTO sessions
+            (session_id, epc, session_date, total_entries, total_exits,
+             total_transitions, has_anomaly, processed_at)
+            VALUES (?, ?, ?, 0, 0, 0, 0, ?)
+        """, (session_id, epc, session_date, datetime.utcnow().isoformat()))
+
+        # Insert the raw read
+        conn.execute("""
+            INSERT INTO raw_reads (
+                session_id, epc, uid, base_logical_device,
+                direction, door, antenna, rssi,
+                tag_time, t0, date_utc, ingested_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            session_id,
+            epc,
+            str(raw_row.get("uid", "")).strip() or None,
+            str(raw_row.get("baselogicaldevice", "")).strip(),
+            str(raw_row.get("direction", "")).strip(),
+            str(raw_row.get("door", "")).strip(),
+            int(raw_row["antenna"]) if raw_row.get("antenna") else None,
+            float(raw_row["rssi"]),
+            int(float(str(raw_row["tagtime"]))),
+            int(raw_row["T0"]),
+            str(raw_row.get("dateutc", "")).strip() or None,
+            datetime.utcnow().isoformat(),
+        ))
+
+
+def write_event_to_db(session_id: str, event: Dict):
+    """
+    Writes a single confirmed event to the database immediately.
+    Called the moment the detection algorithm confirms an event
+    during streaming — before the rest of the session is processed.
+
+    Also updates the session row's event counts so the dashboard
+    sees accurate totals as each event arrives.
+    """
+    event_type = event.get("event", event.get("event_type", ""))
+
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO events (
+                session_id, epc, event_type, t0, door,
+                from_zone, to_zone, peak_rssi, dwell_time, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            session_id,
+            event.get("epc"),
+            event_type,
+            event.get("t0"),
+            event.get("door"),
+            event.get("from_zone"),
+            event.get("to_zone"),
+            event.get("peak_rssi"),
+            event.get("dwell_time"),
+            event.get("note"),
+        ))
+
+        # Increment the appropriate session counter immediately
+        if event_type == "ENTRY":
+            conn.execute("""
+                UPDATE sessions SET total_entries = total_entries + 1
+                WHERE session_id = ?
+            """, (session_id,))
+        elif event_type == "EXIT":
+            conn.execute("""
+                UPDATE sessions SET total_exits = total_exits + 1
+                WHERE session_id = ?
+            """, (session_id,))
+        elif event_type == "ZONE_TRANSITION":
+            conn.execute("""
+                UPDATE sessions SET total_transitions = total_transitions + 1
+                WHERE session_id = ?
+            """, (session_id,))
