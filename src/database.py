@@ -220,7 +220,7 @@ def ingest_raw_reads(file_path: str, sheet_name: str):
     Clears existing rows for this session before inserting so re-running
     is safe and idempotent — you always get a clean slate.
     """
-    from .ingestion import stream_rfid_excel
+    from ingestion import stream_rfid_excel
 
     ingested_at = datetime.utcnow().isoformat()
 
@@ -377,6 +377,23 @@ def get_all_events() -> List[Dict]:
         rows = conn.execute("""
             SELECT * FROM events ORDER BY session_id, t0 ASC
         """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_recent_raw_reads(n: int = 20) -> List[Dict]:
+    """
+    Returns the most recent N raw reads across all sessions.
+    Used by the dashboard live feed to show the raw RFID stream
+    arriving row by row alongside the confirmed events.
+    """
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT session_id, epc, direction, door,
+                   rssi, t0, ingested_at
+            FROM raw_reads
+            ORDER BY id DESC
+            LIMIT ?
+        """, (n,)).fetchall()
     return [dict(r) for r in rows]
 
 

@@ -11,9 +11,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from src.database import (
+    create_schema,
     get_all_sessions,
     get_raw_rows,
     get_all_events,
+    get_recent_raw_reads,
     get_events_for_session,
     get_all_anomalies,
     get_dwell_times,
@@ -24,6 +26,12 @@ from src.database import (
 from src.pipeline import stream_pipeline_events_from_rows
 
 LOG_PATH = PROJECT_ROOT / "data" / "pipeline.log"
+
+# Ensure DB tables exist before any queries.
+# Uses CREATE TABLE IF NOT EXISTS — safe to call on every startup.
+# Without this, opening the dashboard before running the pipeline
+# causes "no such table" errors.
+create_schema()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -39,16 +47,47 @@ st.set_page_config(
 
 
 # ═══════════════════════════════════════════════════════════════
-# DATA LOADING — no cache so streaming data appears immediately
+# DATA LOADING
+# ttl=3 matches the auto-refresh interval. Cached data renders
+# from memory on rerun — reduces the visible flash between refreshes.
 # ═══════════════════════════════════════════════════════════════
 
-sessions_df   = pd.DataFrame(get_all_sessions())
-all_events_df = pd.DataFrame(get_all_events())
-anomalies_df  = pd.DataFrame(get_all_anomalies())
-dwell_df      = pd.DataFrame(get_dwell_times())
-door_df       = pd.DataFrame(get_door_usage())
-zone_df       = pd.DataFrame(get_zone_transition_paths())
-anomaly_sum   = pd.DataFrame(get_anomaly_summary())
+@st.cache_data(ttl=3)
+def load_sessions():
+    return pd.DataFrame(get_all_sessions())
+
+@st.cache_data(ttl=3)
+def load_all_events():
+    return pd.DataFrame(get_all_events())
+
+@st.cache_data(ttl=3)
+def load_anomalies():
+    return pd.DataFrame(get_all_anomalies())
+
+@st.cache_data(ttl=3)
+def load_dwell_times():
+    return pd.DataFrame(get_dwell_times())
+
+@st.cache_data(ttl=3)
+def load_door_usage():
+    return pd.DataFrame(get_door_usage())
+
+@st.cache_data(ttl=3)
+def load_zone_paths():
+    return pd.DataFrame(get_zone_transition_paths())
+
+@st.cache_data(ttl=3)
+def load_anomaly_summary():
+    return pd.DataFrame(get_anomaly_summary())
+
+
+sessions_df   = load_sessions()
+all_events_df = load_all_events()
+anomalies_df  = load_anomalies()
+dwell_df      = load_dwell_times()
+door_df       = load_door_usage()
+zone_df       = load_zone_paths()
+anomaly_sum   = load_anomaly_summary()
 
 pipeline_has_run = not sessions_df.empty
 
@@ -87,6 +126,13 @@ with st.sidebar:
         st.caption("Enable when streaming pipeline is running.")
 
     st.divider()
+
+    # Always visible — streaming command
+    st.markdown("**Start the pipeline:**")
+    st.code("python -m src.main --stream", language="bash")
+    st.caption("Run in a separate terminal, then enable auto-refresh above.")
+
+    st.divider()
     if pipeline_has_run:
         st.caption(
             f"{len(sessions_df)} sessions · "
@@ -121,10 +167,10 @@ with tab1:
         )
 
     elif auto_refresh:
-        # ── Streaming mode: show all events from all sessions ─────
-        # All sessions are treated as one continuous feed.
-        # Events are sorted most recent first so new arrivals appear
-        # at the top as the pipeline writes them.
+        # ── Streaming mode: raw reads + confirmed events ──────────
+        # Shows the raw RFID stream on the left and confirmed events
+        # on the right — so you can see raw reads accumulating into
+        # bursts, and events firing the moment the algorithm confirms them.
         st.subheader("Live event feed")
 
         entries_total = int(sessions_df["total_entries"].sum())
@@ -140,35 +186,55 @@ with tab1:
                   delta="review" if anom_total > 0 else None,
                   delta_color="inverse")
 
-        st.markdown("**All events — most recent first**")
+        st.divider()
+        raw_col, event_col = st.columns(2)
 
-        if not all_events_df.empty:
-            feed = all_events_df.copy()
-            feed = feed.rename(columns={
-                "event_type": "Event",
-                "t0":         "T0 (s)",
-                "door":       "Door",
-                "from_zone":  "From",
-                "to_zone":    "To",
-                "peak_rssi":  "Peak RSSI",
-                "dwell_time": "Dwell (s)",
-            })
-            for col in ["From", "To"]:
-                if col in feed.columns:
-                    feed[col] = feed[col].str.split("__").str[-1]
+        with raw_col:
+            st.markdown("**Raw RFID stream** *(most recent 30 reads)*")
+            raw_reads_df = pd.DataFrame(get_recent_raw_reads(30))
+            if not raw_reads_df.empty:
+                raw_reads_df["session_id"] = raw_reads_df["session_id"].str[-12:]
+                raw_reads_df["epc"]        = raw_reads_df["epc"].str[-8:]
+                raw_reads_df["ingested_at"] = pd.to_datetime(
+                    raw_reads_df["ingested_at"]
+                ).dt.strftime("%H:%M:%S")
+                raw_reads_df = raw_reads_df.rename(columns={
+                    "session_id": "Session",
+                    "epc":        "EPC",
+                    "direction":  "Dir",
+                    "door":       "Door",
+                    "rssi":       "RSSI",
+                    "t0":         "T0 (s)",
+                    "ingested_at":"Time",
+                })
+                st.dataframe(raw_reads_df, width="stretch", height=420)
+            else:
+                st.info("No raw reads yet — stream is starting...")
 
-            cols = [
-                "session_id", "Event", "T0 (s)", "Door",
-                "From", "To", "Dwell (s)", "Peak RSSI",
-            ]
-            cols = [c for c in cols if c in feed.columns]
-
-            if "id" in feed.columns:
-                feed = feed.sort_values("id", ascending=False)
-
-            st.dataframe(feed[cols], width="stretch", height=500)
-        else:
-            st.info("No events yet — stream is starting...")
+        with event_col:
+            st.markdown("**Confirmed events** *(most recent first)*")
+            if not all_events_df.empty:
+                feed = all_events_df.copy()
+                feed = feed.rename(columns={
+                    "event_type": "Event",
+                    "t0":         "T0 (s)",
+                    "door":       "Door",
+                    "from_zone":  "From",
+                    "to_zone":    "To",
+                    "peak_rssi":  "RSSI",
+                    "dwell_time": "Dwell (s)",
+                })
+                for col in ["From", "To"]:
+                    if col in feed.columns:
+                        feed[col] = feed[col].str.split("__").str[-1]
+                feed["session_id"] = feed["session_id"].str[-12:]
+                cols = ["session_id","Event","T0 (s)","Door","From","To","Dwell (s)","RSSI"]
+                cols = [c for c in cols if c in feed.columns]
+                if "id" in feed.columns:
+                    feed = feed.sort_values("id", ascending=False)
+                st.dataframe(feed[cols], width="stretch", height=420)
+            else:
+                st.info("No events yet — algorithm is processing...")
 
     else:
         # ── Static mode: show selected session ───────────────────
@@ -279,6 +345,7 @@ with tab2:
             )
             fig.update_layout(margin=dict(t=10, b=10), height=300,
                               legend=dict(orientation="h"))
+            fig.update_xaxes(type='category')
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
@@ -291,6 +358,7 @@ with tab2:
                 )
                 fig.update_layout(margin=dict(t=10, b=10), height=300,
                                   legend=dict(orientation="h"))
+                fig.update_xaxes(type='category')
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("No door usage data yet.")
@@ -353,6 +421,7 @@ with tab2:
             fig.update_layout(margin=dict(t=10, b=10), height=280,
                               yaxis_tickformat=".0%",
                               legend=dict(orientation="h"))
+            fig.update_xaxes(type='category')
             st.plotly_chart(fig, use_container_width=True)
 
 
@@ -386,6 +455,7 @@ with tab3:
                     color_discrete_sequence=["#D85A30"],
                 )
                 fig.update_layout(margin=dict(t=10, b=10), height=300)
+                fig.update_xaxes(type='category')
                 st.plotly_chart(fig, use_container_width=True)
 
         with col2:
@@ -395,30 +465,49 @@ with tab3:
                 .count().reset_index()
                 .rename(columns={"anomaly_type": "count"})
             )
-            per["session_id"] = per["session_id"].str[-14:]
+            # Add prefix so Plotly treats session IDs as categories,
+            # not numbers — fixes scientific notation and bar widths
+            per["session_id"] = "S_" + per["session_id"].str[-12:]
             fig = px.bar(
                 per, x="session_id", y="count",
                 labels={"session_id": "Session", "count": "Anomaly count"},
                 color_discrete_sequence=["#993C1D"],
             )
             fig.update_layout(margin=dict(t=10, b=10), height=300)
+            fig.update_xaxes(type='category')
             st.plotly_chart(fig, use_container_width=True)
 
         st.divider()
         st.subheader("Session overview")
         ov = sessions_df[[
             "session_id", "session_date", "total_entries", "total_exits",
-            "total_transitions", "ghost_read_ratio",
-            "entry_rssi_strength", "has_anomaly",
+            "total_transitions", "ghost_read_ratio", "entry_rssi_strength",
         ]].copy()
-        ov["has_anomaly"] = ov["has_anomaly"].map({1: "⚠️ Yes", 0: "✅ No"})
+
+        # Derive anomaly flag directly from the anomalies table —
+        # more reliable than the sessions.has_anomaly denormalized column
+        if not anomalies_df.empty:
+            anom_counts = anomalies_df.groupby("session_id").size().reset_index(name="n")
+            ov = ov.merge(anom_counts, on="session_id", how="left")
+            ov["Anomaly"] = ov["n"].fillna(0).apply(
+                lambda x: "⚠️ Yes" if x > 0 else "✅ No"
+            )
+            ov = ov.drop(columns=["n"])
+        else:
+            ov["Anomaly"] = "✅ No"
+
         ov["ghost_read_ratio"] = ov["ghost_read_ratio"].apply(
             lambda x: f"{float(x):.1%}" if x is not None else "N/A"
         )
-        ov.columns = [
-            "Session", "Date", "Entries", "Exits",
-            "Transitions", "Ghost ratio", "Entry signal", "Anomaly",
-        ]
+        ov = ov.rename(columns={
+            "session_id":          "Session",
+            "session_date":        "Date",
+            "total_entries":       "Entries",
+            "total_exits":         "Exits",
+            "total_transitions":   "Transitions",
+            "ghost_read_ratio":    "Ghost ratio",
+            "entry_rssi_strength": "Entry signal",
+        })
         st.dataframe(ov, width="stretch", height=280)
 
         st.divider()
