@@ -212,3 +212,22 @@ in the sidebar causes the dashboard to reload every 3 seconds.
 - Full anomaly log with human-readable notes
 
 ---
+
+## Machine learning
+
+An exploratory Isolation Forest model is built in `notebooks/exploration.ipynb`
+as a complement to the rule-based anomaly detection layer. Rather than catching specific known patterns, it scores each session by how unusual it is across all features simultaneously, flagging sessions that deviate from the norm without fitting any single rule.
+
+**Why Isolation Forest:** unsupervised, no labeled data required. Scores sessions by how easily they can be isolated from the rest using random feature splits. Sessions that stand apart require fewer splits and score higher.
+
+**Feature matrix**: nine features per session from two sources:
+
+*From sessions/events:* `dwell_time`, `total_transitions`, `ghost_read_ratio`, `has_anomaly`
+
+*From raw_reads* (only possible because raw reads are persisted):
+`peak_entry_rssi`, `rssi_slope_in`, `rssi_slope_out`, `read_density`,
+`antenna_count`
+
+Using raw_reads features directly, rather than the categorical labels derived from them, preserves the full signal precision for the model.
+
+**Production note:** this implementation trains on all available sessions and runs in inference-only mode. In a production system with a continuous stream, River's `HalfSpaceTrees` would replace it, an online learning equivalent that updates the model incrementally with each new session without retraining from scratch.
