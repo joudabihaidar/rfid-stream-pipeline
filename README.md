@@ -11,6 +11,7 @@ people's entry and exit events from a building.
 - [How to run](#how-to-run)
 - [Output files](#output-files)
 - [Viewing the database](#viewing-the-database)
+- [Architecture](#architecture)
 
 ## Tech Stack
 
@@ -27,7 +28,7 @@ people's entry and exit events from a building.
 ### 1. Clone the repository
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/joudabihaidar/rfid-stream-pipeline.git
 cd rfid-pipeline
 ```
 
@@ -94,3 +95,14 @@ https://sqlitebrowser.org/dl/
 4. Click the **Browse Data** tab and select a table from the dropdown
 
 Four tables are available: `raw_reads`, `sessions`, `events`, `anomalies`.
+
+## Architecture
+
+- The system streams raw RFID reads from an Excel workbook row by row,
+simulating a live hardware stream. Each read is immediately persisted to a SQLite database, then fed through a custom detection algorithm that groups reads into bursts, filters ghost reads, and confirms entry/exit events using a state machine. 
+A Streamlit dashboard reads from the same database in parallel, refreshing every 3 seconds to show events appearing in real time as the algorithm detects them.
+
+- The system runs as two parallel processes connected only through a shared
+SQLite database with WAL mode enabled, allowing the pipeline to write
+and the dashboard to read simultaneously without locking.
+![Architecture diagram](docs/architecture.PNG)
