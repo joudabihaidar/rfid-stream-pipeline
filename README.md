@@ -188,3 +188,27 @@ Higher means noisier signal environment.
 - `entry_rssi_strength`: peak RSSI during the entry burst, categorized as strong (≥ -65 dBm), moderate (≥ -70 dBm), or weak (< -70 dBm).
 
 ---
+
+## Dashboard
+
+Three tabs, all reading from the SQLite database. When the streaming
+pipeline is running in a separate terminal, enabling **Auto-refresh**
+in the sidebar causes the dashboard to reload every 3 seconds.
+
+**Live Feed**: two side-by-side tables: raw RFID reads on the left
+(arriving row by row from `raw_reads`) and confirmed events on the right (appearing the moment the algorithm detects them). Four live metrics: currently inside, total entries, total exits, anomalies flagged.
+
+**Access Patterns**: session-level analytics:
+- Entries and exits per session (bar chart)
+- Door usage: which doors used for entry vs exit (bar chart)
+- Dwell time distribution (histogram)
+- Zone transition paths (table)
+- Ghost read ratio per session colored by entry signal strength (bar chart)
+
+**Anomalies**: rule-based detection results:
+- Anomaly counts by type (bar chart)
+- Anomalies per session (bar chart)
+- Session overview with ghost ratio, entry signal, and anomaly flag
+- Full anomaly log with human-readable notes
+
+---
