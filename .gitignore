@@ -13,7 +13,7 @@ wheels/
 .env
 
 # Data
-/data
-
+/data/*
+!/data/raw_data.xlsx
 # Testing notebooks
 /testing
