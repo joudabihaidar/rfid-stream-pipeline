@@ -13,6 +13,9 @@ people's entry and exit events from a building.
 - [Viewing the database](#viewing-the-database)
 - [Architecture](#architecture)
 - [Detection algorithm](#detection-algorithm)
+- [Anomaly detection](#anomaly-detection)
+- [Dashboard](#dashboard)
+- [Machine learning](#machine-learning)
 
 ## Tech Stack
 
@@ -161,3 +164,27 @@ t0:        t0_end of the new burst
 ```
 
 On EXIT, the tracker resets and `current_zone` returns to None.
+
+## Anomaly Detection
+
+Two separate layers run after the detection algorithm completes each session.
+
+**Rule-based anomalies** (`analytics/anomaly.py`): seven specific behavioral patterns flagged as anomalies:
+
+| Type | Trigger |
+|---|---|
+| `EXIT_WITHOUT_ENTRY` | Exit confirmed with no prior entry |
+| `SHORT_DWELL` | Dwell time below 10 seconds |
+| `LONG_DWELL` | Dwell time above 120 seconds |
+| `RAPID_REENTRY` | Entry within 30 seconds of a prior exit |
+| `SESSION_ENDED_INSIDE` | Stream ended with person still confirmed inside |
+| `SIMULTANEOUS_TRANSITIONS` | Two zone transitions at the same T0 |
+| `OUT_READS_NO_IN_READS` | A door has Out reads but no In reads at all |
+
+**Data quality metrics** (`analytics/quality.py`): stored on the sessions row, not in the anomalies table. These are not behavioral anomalies but diagnostic signals about how reliable the events are:
+
+- `ghost_read_ratio`: Out reads while confirmed inside / total reads.
+Higher means noisier signal environment.
+- `entry_rssi_strength`: peak RSSI during the entry burst, categorized as strong (≥ -65 dBm), moderate (≥ -70 dBm), or weak (< -70 dBm).
+
+---
