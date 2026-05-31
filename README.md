@@ -12,6 +12,7 @@ people's entry and exit events from a building.
 - [Output files](#output-files)
 - [Viewing the database](#viewing-the-database)
 - [Architecture](#architecture)
+- [Detection algorithm](#detection-algorithm)
 
 ## Tech Stack
 
@@ -105,4 +106,58 @@ A Streamlit dashboard reads from the same database in parallel, refreshing every
 - The system runs as two parallel processes connected only through a shared
 SQLite database with WAL mode enabled, allowing the pipeline to write
 and the dashboard to read simultaneously without locking.
+
 ![Architecture diagram](docs/architecture.PNG)
+
+## Detection Algorithm
+
+Raw RFID data arrives as individual antenna reads, one row every time a reader picks up a tag. A single door crossing generates dozens of these rows.
+The algorithm's job is to collapse that noise into meaningful events: ENTRY, EXIT, and ZONE_TRANSITION.
+
+### Step 1: Grouping reads into bursts
+
+Rows are grouped by `(epc, reader, direction)`: same person, same reader, same direction. A group stays open as long as rows keep arriving within **3 seconds of each other**. The moment a gap larger than 3 seconds is detected, the group closes and becomes a burst.
+
+The 3-second gap threshold was chosen because it matches the natural pause between a person moving away from one reader and approaching another.
+
+When a group closes, it is aggregated into a single summary:
+`count`, `peak_rssi`, `t0_start`, `t0_end`.
+
+### Step 2: Three filters every burst must pass
+
+Before the algorithm makes any decision, each burst passes three filters:
+
+1. **Noise filter**: bursts with fewer than 3 reads are discarded.
+   Too few reads to be a reliable detection.
+
+2. **Ghost suppression**: Out bursts with `peak_rssi < -72 dBm` are
+   discarded while the person is inside or in an unknown state. The outside reader can pick up weak signals through the wall when someone is standing inside near the door. This is a one-directional problem. In reads are never filtered this way because the inside reader's antenna points inward and cannot meaningfully detect someone standing outside.
+
+3. **Duplicate filter**: In bursts are discarded if the person is already confirmed inside. Out bursts are discarded if already confirmed outside. A person cannot enter twice without exiting first.
+
+### Step 3: Confirming exits (EPCTracker)
+
+`EPCTracker` is a state machine with three states: `UNKNOWN → INSIDE → OUTSIDE`.
+
+In bursts that pass all filters confirm an ENTRY and move state to INSIDE.
+Out bursts that pass all filters are not immediately confirmed as an EXIT.
+Instead the burst is held as a **pending exit** for up to 10 seconds.
+
+If an In burst arrives within that window, the algorithm compares RSSI:
+- `out_rssi ≤ in_rssi` → the Out was a ghost read. Discard it, confirm ENTRY only.
+- `out_rssi > in_rssi` → the Out was genuine. Confirm EXIT then ENTRY.
+
+If 10 seconds pass with no In burst, the exit is confirmed regardless.
+
+### Step 4: Zone transitions (MovementTracker)
+
+`MovementTracker` runs in parallel while the person is confirmed INSIDE.
+It tracks the last reader that had a confirmed burst. When a new confirmed burst arrives from a different reader, a ZONE_TRANSITION event fires:
+
+```
+from_zone: Storage_In__Door1_Box1
+to_zone:   Storage_In__Door2_Box1
+t0:        t0_end of the new burst
+```
+
+On EXIT, the tracker resets and `current_zone` returns to None.
