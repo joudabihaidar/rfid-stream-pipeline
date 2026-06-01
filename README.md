@@ -16,6 +16,7 @@ people's entry and exit events from a building.
 - [Anomaly detection](#anomaly-detection)
 - [Dashboard](#dashboard)
 - [Machine learning](#machine-learning)
+- [Production upgrade path](#production-upgrade-path)
 
 ## Tech Stack
 
@@ -37,12 +38,22 @@ cd rfid-pipeline
 ```
 
 ### 2. Install dependencies
-
+ 
 ```bash
 # Option A — UV (recommended)
+# Install UV first if you don't have it:
+# https://docs.astral.sh/uv/getting-started/installation/
 uv sync
-
+ 
 # Option B — pip
+# Create and activate a virtual environment first:
+python -m venv .venv
+ 
+# Windows:
+.venv\Scripts\activate
+# Mac/Linux:
+source .venv/bin/activate
+ 
 pip install -r requirements.txt
 ```
 
@@ -111,6 +122,15 @@ SQLite database with WAL mode enabled, allowing the pipeline to write
 and the dashboard to read simultaneously without locking.
 
 ![Architecture diagram](docs/architecture.PNG)
+
+## Database schema
+ 
+Four tables, two stages. Stage 1 (`raw_reads`) is the ingestion layer, raw data persisted before any processing. 
+Stage 2 (`sessions`, `events`,`anomalies`) is the processed output. All tables reference `sessions.session_id`.
+ 
+![Database schema](docs/db_schema.PNG)
+ 
+---
 
 ## Detection Algorithm
 
@@ -231,3 +251,15 @@ as a complement to the rule-based anomaly detection layer. Rather than catching 
 Using raw_reads features directly, rather than the categorical labels derived from them, preserves the full signal precision for the model.
 
 **Production note:** this implementation trains on all available sessions and runs in inference-only mode. In a production system with a continuous stream, River's `HalfSpaceTrees` would replace it, an online learning equivalent that updates the model incrementally with each new session without retraining from scratch.
+
+---
+
+## Production upgrade path
+  
+| Component | Current | Production upgrade |
+|---|---|---|
+| Data ingestion | `stream_rfid_excel()` reading Excel | Apache Kafka consumer |
+| Database | SQLite + WAL | PostgreSQL |
+| Dashboard | Streamlit polling every 3s | Grafana with live data source |
+| Anomaly scoring | Isolation Forest (batch, scikit-learn) | River `HalfSpaceTrees` (online) |
+| Concurrency | WAL mode (single writer) | PostgreSQL connection pooling |
