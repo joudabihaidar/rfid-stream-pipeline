@@ -12,6 +12,7 @@ people's entry and exit events from a building.
 - [Output files](#output-files)
 - [Viewing the database](#viewing-the-database)
 - [Architecture](#architecture)
+- [Database schema](#database-schema)
 - [Detection algorithm](#detection-algorithm)
 - [Anomaly detection](#anomaly-detection)
 - [Dashboard](#dashboard)
