@@ -21,6 +21,7 @@ from .database import (
     ingest_single_row,
     write_event_to_db,
     clear_session_data,
+    get_connection,
     get_raw_rows,
     get_all_sessions,
     get_events_for_session,
@@ -344,7 +345,6 @@ def run_streaming(file_path: str, delay: float = 0.02):
             update_session_quality(sheet_name, quality)
 
             if anomalies:
-                from database import get_connection
                 with get_connection() as conn:
                     conn.execute(
                         "UPDATE sessions SET has_anomaly = 1 WHERE session_id = ?",
